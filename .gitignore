@@ -1,12 +1,12 @@
 # Binaries
-nexus
-nexus.exe
-nexus-darwin-amd64
-nexus-darwin-arm64
-nexusctl
-nexusctl.exe
-nexusctl-darwin-amd64
-nexusctl-darwin-arm64
+/nexus
+/nexus.exe
+/nexus-darwin-amd64
+/nexus-darwin-arm64
+/nexusctl
+/nexusctl.exe
+/nexusctl-darwin-amd64
+/nexusctl-darwin-arm64
 
 # Data
 data/
