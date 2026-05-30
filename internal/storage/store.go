@@ -1,0 +1,435 @@
+package storage
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"nexus/internal/common"
+)
+
+var (
+	ErrObjectNotFound    = errors.New("object not found")
+	ErrBucketNotFound   = errors.New("bucket not found")
+	ErrInvalidTier      = errors.New("invalid storage tier")
+	ErrTierNotAvailable = errors.New("storage tier not available")
+	ErrInvalidObjectKey  = errors.New("invalid object key")
+	ErrInvalidBucketName = errors.New("invalid bucket name")
+)
+
+type ObjectStore interface {
+	Put(ctx context.Context, bucket, key string, data io.Reader, size int64, metadata *common.ObjectMetadata) error
+	Get(ctx context.Context, bucket, key string) (io.ReadCloser, *common.ObjectMetadata, error)
+	Delete(ctx context.Context, bucket, key string) error
+	Head(ctx context.Context, bucket, key string) (*common.ObjectMetadata, error)
+	List(ctx context.Context, bucket, prefix string, maxKeys int) ([]*common.ObjectMetadata, error)
+	Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string) error
+}
+
+type TieredStore interface {
+	Put(ctx context.Context, bucket, key string, data io.Reader, size int64, tier common.StorageTier, metadata *common.ObjectMetadata) error
+	Get(ctx context.Context, bucket, key string, tier common.StorageTier) (io.ReadCloser, *common.ObjectMetadata, error)
+	Delete(ctx context.Context, bucket, key string, tier common.StorageTier) error
+	Head(ctx context.Context, bucket, key string) (*common.ObjectMetadata, error)
+	Migrate(ctx context.Context, bucket, key string, fromTier, toTier common.StorageTier) error
+	GetTierSize(tier common.StorageTier) (int64, error)
+}
+
+type BackendStorage interface {
+	io.Closer
+	Name() string
+	Put(ctx context.Context, path string, data io.Reader, size int64) error
+	Get(ctx context.Context, path string) (io.ReadCloser, error)
+	Delete(ctx context.Context, path string) error
+	Exists(ctx context.Context, path string) (bool, error)
+	Size(ctx context.Context, path string) (int64, error)
+	List(ctx context.Context, prefix string) ([]string, error)
+}
+
+type FileBackend struct {
+	mu      sync.RWMutex
+	rootDir string
+}
+
+func NewFileBackend(rootDir string) (*FileBackend, error) {
+	if err := os.MkdirAll(rootDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create storage directory: %w", err)
+	}
+	return &FileBackend{
+		rootDir: rootDir,
+	}, nil
+}
+
+func (f *FileBackend) Name() string {
+	return "file"
+}
+
+func (f *FileBackend) Put(ctx context.Context, path string, data io.Reader, size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	fullPath := filepath.Join(f.rootDir, path)
+
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	file, err := os.Create(fullPath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	written, err := io.Copy(file, data)
+	if err != nil {
+		os.Remove(fullPath)
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	// Only validate size if it was specified (size > 0)
+	// size == 0 means the size is unknown (e.g., encrypted data with GCM overhead)
+	if size > 0 && written != size {
+		os.Remove(fullPath)
+		return fmt.Errorf("incomplete write: expected %d, got %d", size, written)
+	}
+
+	if err := file.Sync(); err != nil {
+		os.Remove(fullPath)
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	return nil
+}
+
+func (f *FileBackend) Get(ctx context.Context, path string) (io.ReadCloser, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	fullPath := filepath.Join(f.rootDir, path)
+
+	file, err := os.Open(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrObjectNotFound
+		}
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+
+	return file, nil
+}
+
+func (f *FileBackend) Delete(ctx context.Context, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	fullPath := filepath.Join(f.rootDir, path)
+
+	err := os.Remove(fullPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete file: %w", err)
+	}
+
+	return nil
+}
+
+func (f *FileBackend) Exists(ctx context.Context, path string) (bool, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	fullPath := filepath.Join(f.rootDir, path)
+
+	_, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	return true, nil
+}
+
+func (f *FileBackend) Size(ctx context.Context, path string) (int64, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	fullPath := filepath.Join(f.rootDir, path)
+
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, ErrObjectNotFound
+		}
+		return 0, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	return info.Size(), nil
+}
+
+func (f *FileBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	var files []string
+	searchPath := filepath.Join(f.rootDir, prefix)
+
+	err := filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			relPath, err := filepath.Rel(f.rootDir, path)
+			if err == nil {
+				files = append(files, relPath)
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list files: %w", err)
+	}
+
+	return files, nil
+}
+
+func (f *FileBackend) Close() error {
+	return nil
+}
+
+type objectLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+type TieredObjectStore struct {
+	mu          sync.RWMutex
+	tiers       map[common.StorageTier]BackendStorage
+	currentSize map[common.StorageTier]int64
+	maxSize     map[common.StorageTier]int64
+	objectIndex map[string]*common.ObjectMetadata
+	objLocks    sync.Map
+	locksMu     sync.Mutex
+}
+
+func NewTieredObjectStore() *TieredObjectStore {
+	return &TieredObjectStore{
+		tiers:       make(map[common.StorageTier]BackendStorage),
+		currentSize: make(map[common.StorageTier]int64),
+		maxSize:     make(map[common.StorageTier]int64),
+		objectIndex: make(map[string]*common.ObjectMetadata),
+	}
+}
+
+func (s *TieredObjectStore) RegisterTier(tier common.StorageTier, backend BackendStorage, maxSize int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tiers[tier] = backend
+	s.maxSize[tier] = maxSize
+}
+
+func (s *TieredObjectStore) Put(ctx context.Context, bucket, key string, data io.Reader, size int64, tier common.StorageTier, metadata *common.ObjectMetadata) error {
+	s.lockObject(bucket, key)
+	defer s.unlockObject(bucket, key)
+
+	s.mu.RLock()
+	path := s.makePath(bucket, key)
+	backend, ok := s.tiers[tier]
+	s.mu.RUnlock()
+
+	if !ok {
+		return ErrTierNotAvailable
+	}
+
+	if err := backend.Put(ctx, path, data, size); err != nil {
+		return fmt.Errorf("failed to put object: %w", err)
+	}
+
+	s.mu.Lock()
+	s.currentSize[tier] += size
+
+	objKey := bucket + "/" + key
+	if metadata == nil {
+		metadata = &common.ObjectMetadata{}
+	}
+	metadata.Key = key
+	metadata.Bucket = bucket
+	metadata.Size = size
+	metadata.StorageTier = tier
+
+	s.objectIndex[objKey] = metadata
+	s.mu.Unlock()
+
+	return nil
+}
+
+func (s *TieredObjectStore) Get(ctx context.Context, bucket, key string, tier common.StorageTier) (io.ReadCloser, *common.ObjectMetadata, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	objKey := bucket + "/" + key
+	metadata, ok := s.objectIndex[objKey]
+
+	path := s.makePath(bucket, key)
+	backend, ok := s.tiers[tier]
+	if !ok {
+		return nil, nil, ErrTierNotAvailable
+	}
+
+	reader, err := backend.Get(ctx, path)
+	if err != nil {
+		if metadata == nil {
+			return nil, nil, ErrObjectNotFound
+		}
+		return nil, nil, fmt.Errorf("failed to get object: %w", err)
+	}
+
+	if metadata == nil {
+		metadata = &common.ObjectMetadata{
+			Key:         key,
+			Bucket:      bucket,
+			StorageTier: tier,
+		}
+		s.objectIndex[objKey] = metadata
+	}
+
+	return reader, metadata, nil
+}
+
+func (s *TieredObjectStore) Delete(ctx context.Context, bucket, key string, tier common.StorageTier) error {
+	s.lockObject(bucket, key)
+	defer s.unlockObject(bucket, key)
+
+	s.mu.RLock()
+	path := s.makePath(bucket, key)
+	backend, ok := s.tiers[tier]
+	s.mu.RUnlock()
+
+	if !ok {
+		return ErrTierNotAvailable
+	}
+
+	if err := backend.Delete(ctx, path); err != nil {
+		return fmt.Errorf("failed to delete object: %w", err)
+	}
+
+	s.mu.Lock()
+	objKey := bucket + "/" + key
+	if metadata, ok := s.objectIndex[objKey]; ok {
+		s.currentSize[tier] -= metadata.Size
+		delete(s.objectIndex, objKey)
+	}
+	s.mu.Unlock()
+
+	return nil
+}
+
+func (s *TieredObjectStore) Head(ctx context.Context, bucket, key string) (*common.ObjectMetadata, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	objKey := bucket + "/" + key
+	metadata, ok := s.objectIndex[objKey]
+	if !ok {
+		return nil, ErrObjectNotFound
+	}
+
+	return metadata, nil
+}
+
+func (s *TieredObjectStore) Migrate(ctx context.Context, bucket, key string, fromTier, toTier common.StorageTier) error {
+	s.lockObject(bucket, key)
+	defer s.unlockObject(bucket, key)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	objKey := bucket + "/" + key
+	metadata, ok := s.objectIndex[objKey]
+	if !ok {
+		return ErrObjectNotFound
+	}
+
+	if metadata.StorageTier != fromTier {
+		return fmt.Errorf("object is not in source tier")
+	}
+
+	srcPath := s.makePath(bucket, key)
+	srcBackend, ok := s.tiers[fromTier]
+	if !ok {
+		return ErrTierNotAvailable
+	}
+
+	reader, err := srcBackend.Get(ctx, srcPath)
+	if err != nil {
+		return fmt.Errorf("failed to read from source: %w", err)
+	}
+	defer reader.Close()
+
+	dstPath := s.makePath(bucket, key)
+	dstBackend, ok := s.tiers[toTier]
+	if !ok {
+		return ErrTierNotAvailable
+	}
+
+	if err := dstBackend.Put(ctx, dstPath, reader, metadata.Size); err != nil {
+		return fmt.Errorf("failed to write to destination: %w", err)
+	}
+
+	_ = srcBackend.Delete(ctx, srcPath)
+
+	s.currentSize[fromTier] -= metadata.Size
+	s.currentSize[toTier] += metadata.Size
+	metadata.StorageTier = toTier
+
+	return nil
+}
+
+func (s *TieredObjectStore) GetTierSize(tier common.StorageTier) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentSize[tier], nil
+}
+
+func (s *TieredObjectStore) lockObject(bucket, key string) {
+	objKey := bucket + "/" + key
+
+	s.locksMu.Lock()
+	lock, ok := s.objLocks.Load(objKey)
+	if !ok {
+		lock = &objectLock{}
+		s.objLocks.Store(objKey, lock)
+	}
+	ol := lock.(*objectLock)
+	ol.refs++
+	s.locksMu.Unlock()
+
+	ol.mu.Lock()
+}
+
+func (s *TieredObjectStore) unlockObject(bucket, key string) {
+	objKey := bucket + "/" + key
+
+	lock, ok := s.objLocks.Load(objKey)
+	if !ok {
+		return
+	}
+	ol := lock.(*objectLock)
+
+	ol.mu.Unlock()
+
+	s.locksMu.Lock()
+	ol.refs--
+	if ol.refs == 0 {
+		s.objLocks.Delete(objKey)
+	}
+	s.locksMu.Unlock()
+}
+
+func (s *TieredObjectStore) makePath(bucket, key string) string {
+	return bucket + "/" + key
+}

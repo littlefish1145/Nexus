@@ -1,0 +1,115 @@
+version: "2.0"
+
+node:
+  role: "all"
+  listen_addr: ":8080"
+  data_dir: "./data"
+  cluster_peers: []
+
+tiering:
+  enabled: true
+  schedule: "*/6 * * * *"
+  hot_max_size: "10GB"
+  warm_devices: []
+  cold_devices: []
+  archive_path: ""
+
+encryption:
+  kms_type: "local"
+  vault_addr: ""
+  vault_token_file: ""
+  vault_transit_key: "nexus"
+  aws_kms_key_id: ""
+  aws_region: "us-east-1"
+  enable_dedup: true
+  master_key_path: "./data/master.key"
+
+vector:
+  enabled: false
+  hot_index_size: "10GB"
+  model_dir: "/models"
+  dim: 768
+  index_type: "hnsw"
+  metric_type: "cosine"
+  max_vectors: 1000000
+  embedding_provider: "mock"
+  embedding_model_path: ""
+  embedding_api_endpoint: ""
+  embedding_api_key: ""
+  embedding_model_name: ""
+
+pipelines:
+  config_file: "./pipelines.yaml"
+  max_concurrent: 10
+  enabled: true
+
+cache:
+  metadata_max_size: "1GB"
+  object_max_size: "5GB"
+  policy: "tinyLFU"
+  ttl: "5m"
+
+performance:
+  max_upload_size: "50GB"
+  max_concurrent_uploads: 50
+  io_workers_per_core: 2
+  use_direct_io: false
+  enable_http2: true
+  read_buffer_size: 32768
+  write_buffer_size: 32768
+
+logging:
+  level: "info"
+  format: "json"
+  output_path: ""
+
+auth:
+  require_auth: false
+  anonymous_read: true
+  jwt_secret: ""
+  token_expiry: "24h"
+  refresh_expiry: "168h"
+
+tls:
+  enabled: false
+  cert_file: "./data/cert.pem"
+  key_file: "./data/key.pem"
+  auto_cert: true
+  auto_cert_host: "localhost"
+  redirect_addr: ":80"
+  min_version: "1.2"
+
+ratelimit:
+  enabled: true
+  global_rps: 1000
+  global_burst: 100
+  ip_rps: 100
+  ip_burst: 20
+  user_rps: 50
+  user_burst: 10
+  bucket_rps: 200
+  bucket_burst: 30
+  upload_bytes_per_sec: 52428800
+  upload_burst_bytes: 104857600
+  whitelist:
+    - "127.0.0.1"
+    - "::1"
+  api_limits:
+    PUT:
+      rps: 100
+      burst: 20
+    GET:
+      rps: 1000
+      burst: 100
+    DELETE:
+      rps: 500
+      burst: 50
+    LIST:
+      rps: 100
+      burst: 20
+    HEAD:
+      rps: 2000
+      burst: 200
+
+replication:
+  allow_private_endpoint: false

@@ -1,0 +1,113 @@
+version: "2.0"
+
+node:
+  role: "all"
+  listen_addr: ":8080"
+  data_dir: "/var/lib/nexus"
+  cluster_peers: []
+
+tiering:
+  enabled: true
+  schedule: "*/6 * * * *"
+  hot_max_size: "10GB"
+  warm_devices:
+    - "/data/warm"
+  cold_devices:
+    - "/data/cold"
+  archive_path: "/data/archive"
+
+encryption:
+  kms_type: "local"
+  vault_addr: ""
+  vault_token_file: ""
+  vault_transit_key: "nexus"
+  aws_kms_key_id: ""
+  aws_region: "us-east-1"
+  enable_dedup: true
+  master_key_path: "/etc/nexus/master.key"
+
+vector:
+  enabled: false
+  hot_index_size: "10GB"
+  model_dir: "/models"
+  dim: 768
+  index_type: "hnsw"
+  metric_type: "cosine"
+  max_vectors: 1000000
+
+pipelines:
+  config_file: "/etc/nexus/pipelines.yaml"
+  max_concurrent: 10
+  enabled: true
+
+cache:
+  metadata_max_size: "1GB"
+  object_max_size: "5GB"
+  policy: "tinyLFU"
+  ttl: "5m"
+
+performance:
+  max_upload_size: "50GB"
+  max_concurrent_uploads: 50
+  io_workers_per_core: 2
+  use_direct_io: false
+  enable_http2: true
+  read_buffer_size: 32768
+  write_buffer_size: 32768
+
+logging:
+  level: "info"
+  format: "json"
+  output_path: "/var/log/nexus/nexus.log"
+
+auth:
+  require_auth: true
+  anonymous_read: false
+  jwt_secret: ""
+  token_expiry: "24h"
+  refresh_expiry: "168h"
+
+tls:
+  enabled: true
+  cert_file: "/etc/nexus/cert.pem"
+  key_file: "/etc/nexus/key.pem"
+  auto_cert: false
+  auto_cert_host: ""
+  redirect_addr: ":80"
+  min_version: "1.2"
+
+ratelimit:
+  enabled: true
+  global_rps: 5000
+  global_burst: 200
+  ip_rps: 500
+  ip_burst: 50
+  user_rps: 100
+  user_burst: 20
+  bucket_rps: 500
+  bucket_burst: 50
+  upload_bytes_per_sec: 104857600
+  upload_burst_bytes: 209715200
+  whitelist:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+  api_limits:
+    PUT:
+      rps: 200
+      burst: 30
+    GET:
+      rps: 2000
+      burst: 200
+    DELETE:
+      rps: 1000
+      burst: 100
+    LIST:
+      rps: 200
+      burst: 30
+    HEAD:
+      rps: 5000
+      burst: 500
+
+replication:
+  allow_private_endpoint: false

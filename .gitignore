@@ -1,0 +1,59 @@
+# Binaries
+nexus
+nexus.exe
+nexus-darwin-amd64
+nexus-darwin-arm64
+nexusctl
+nexusctl.exe
+nexusctl-darwin-amd64
+nexusctl-darwin-arm64
+
+# Data
+data/
+*.db
+*.log
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
+coverage.txt
+
+# Dependencies
+vendor/
+
+# AI Models
+models/
+model/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+stdout.log
+stderr.log

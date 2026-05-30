@@ -1,0 +1,62 @@
+pipelines:
+  - name: "image-optimizer"
+    trigger: "on_upload"
+    filter: "content-type matches 'image/*' and size < 10MB"
+    enabled: true
+    priority: 10
+    steps:
+      - name: "compress"
+        plugin: "image_compress"
+        params:
+          format: "webp"
+          quality: "80"
+        output: "{key}_compressed.webp"
+        tags:
+          purpose: "web_optimized"
+      - name: "thumbnail"
+        plugin: "image_resize"
+        params:
+          width: "256"
+          height: "256"
+          fit: "cover"
+        output: "{key}_thumb.jpg"
+      - name: "exif_extract"
+        plugin: "metadata_extract"
+        output_metadata: true
+
+  - name: "watermark-on-read"
+    trigger: "on_get"
+    filter: "metadata.requires_watermark == 'true'"
+    enabled: true
+    priority: 5
+    steps:
+      - name: "add_watermark"
+        plugin: "image_watermark"
+        params:
+          text: "© Nexus"
+          position: "bottom-right"
+        inline: true
+
+  - name: "pii-redaction"
+    trigger: "on_upload"
+    filter: "content-type matches 'text/*' or content-type matches 'application/json'"
+    enabled: true
+    priority: 20
+    steps:
+      - name: "redact_pii"
+        plugin: "encrypt_pii"
+        output: "{key}.redacted"
+        on_error: "skip"
+
+  - name: "video-thumbnail"
+    trigger: "on_upload"
+    filter: "content-type matches 'video/*' and size < 100MB"
+    enabled: true
+    priority: 8
+    steps:
+      - name: "extract_thumbnail"
+        plugin: "video_thumbnail"
+        params:
+          timestamp: "00:00:01"
+          format: "jpg"
+        output: "{key}_thumb.jpg"
