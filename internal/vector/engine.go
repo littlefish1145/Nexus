@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -82,13 +83,16 @@ type HNSWIndex struct {
 	efSearch       int
 	ml             float32
 	metric         MetricType
+	entryPoint     string
+	M              int
+	maxM0          int
 	stats          IndexStats
 }
 
 type HNSWEntry struct {
 	ID        string
 	Level     int
-	Neighbors []string
+	Neighbors [][]string // Neighbors[layer] = list of neighbor IDs at that layer
 }
 
 func NewHNSWIndex(dim int, metric MetricType) (*HNSWIndex, error) {
@@ -109,6 +113,9 @@ func NewHNSWIndex(dim int, metric MetricType) (*HNSWIndex, error) {
 		efSearch:        50,
 		ml:              0.6931,
 		metric:          metric,
+		entryPoint:      "",
+		M:               16,
+		maxM0:           32,
 		stats: IndexStats{
 			Dimension:   dim,
 			IndexType:   "HNSW",
@@ -143,14 +150,20 @@ func (h *HNSWIndex) Insert(ctx context.Context, vectors []Vector) error {
 		entry := &HNSWEntry{
 			ID:        v.ID,
 			Level:     level,
-			Neighbors: make([]string, level+1),
+			Neighbors: make([][]string, level+1),
 		}
-
 		for l := 0; l <= level; l++ {
-			entry.Neighbors[l] = ""
+			entry.Neighbors[l] = make([]string, 0)
 		}
 		h.graph[v.ID] = entry
 
+		if h.entryPoint == "" {
+			h.entryPoint = v.ID
+			h.stats.TotalVectors++
+			continue
+		}
+
+		h.insertIntoGraph(v.ID, v.Values, level)
 		h.stats.TotalVectors++
 	}
 
@@ -183,9 +196,31 @@ func (h *HNSWIndex) Search(ctx context.Context, query Vector, topK int, filters 
 		return nil, ErrInvalidDimension
 	}
 
-	var searchResults []SearchResult
+	if h.entryPoint == "" || len(h.vectors) == 0 {
+		return nil, nil
+	}
 
-	for id, v := range h.vectors {
+	// Phase 1: greedy descent from top layer to layer 1
+	ep := h.entryPoint
+	epEntry := h.graph[ep]
+	for l := epEntry.Level; l >= 1; l-- {
+		ep = h.greedyClosest(query.Values, ep, l)
+	}
+
+	// Phase 2: searchLayer at layer 0 with ef=max(efSearch, topK)
+	ef := h.efSearch
+	if topK > ef {
+		ef = topK
+	}
+	candidates := h.searchLayer(query.Values, ep, ef, 0)
+
+	// Apply metadata filters and convert to results
+	var searchResults []SearchResult
+	for _, c := range candidates {
+		v, ok := h.vectors[c.ID]
+		if !ok {
+			continue
+		}
 		if len(filters) > 0 {
 			match := true
 			for k, val := range filters {
@@ -203,9 +238,9 @@ func (h *HNSWIndex) Search(ctx context.Context, query Vector, topK int, filters 
 			}
 		}
 
-		score := h.calculateDistance(query.Values, v.Values)
+		score := h.similarityScore(c.Score)
 		searchResults = append(searchResults, SearchResult{
-			ID:        id,
+			ID:        c.ID,
 			Score:     score,
 			Metadata:  v.Metadata,
 			Bucket:    v.Bucket,
@@ -228,16 +263,185 @@ func (h *HNSWIndex) Search(ctx context.Context, query Vector, topK int, filters 
 	return searchResults, nil
 }
 
-func (h *HNSWIndex) calculateDistance(a, b []float32) float32 {
+// hnswDistance returns a distance where lower = more similar.
+func (h *HNSWIndex) hnswDistance(a, b []float32) float32 {
 	switch h.metric {
 	case MetricCosine:
-		return cosineSimilarity(a, b)
+		return 1 - cosineSimilarity(a, b)
 	case MetricEuclidean:
 		return euclideanDistance(a, b)
 	case MetricDotProduct:
-		return dotProduct(a, b)
+		return -dotProduct(a, b)
 	default:
-		return cosineSimilarity(a, b)
+		return 1 - cosineSimilarity(a, b)
+	}
+}
+
+// similarityScore converts distance to similarity (higher = more similar).
+func (h *HNSWIndex) similarityScore(dist float32) float32 {
+	switch h.metric {
+	case MetricCosine:
+		return 1 - dist
+	case MetricEuclidean:
+		return 1 / (1 + dist)
+	case MetricDotProduct:
+		return -dist
+	default:
+		return 1 - dist
+	}
+}
+
+// greedyClosest does greedy search to find closest node at a given layer.
+func (h *HNSWIndex) greedyClosest(query []float32, ep string, layer int) string {
+	cur := ep
+	curDist := h.hnswDistance(query, h.vectors[cur].Values)
+	changed := true
+	for changed {
+		changed = false
+		entry := h.graph[cur]
+		if layer < len(entry.Neighbors) {
+			for _, nID := range entry.Neighbors[layer] {
+				if nVec, ok := h.vectors[nID]; ok {
+					d := h.hnswDistance(query, nVec.Values)
+					if d < curDist {
+						curDist = d
+						cur = nID
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return cur
+}
+
+// searchLayer performs beam search at a layer, returns ef closest candidates sorted by distance ascending.
+func (h *HNSWIndex) searchLayer(query []float32, entryPoint string, ef int, layer int) []searchCandidate {
+	epDist := h.hnswDistance(query, h.vectors[entryPoint].Values)
+
+	visited := map[string]bool{entryPoint: true}
+	candidates := []searchCandidate{{ID: entryPoint, Score: epDist}}
+	resultSet := []searchCandidate{{ID: entryPoint, Score: epDist}}
+
+	for len(candidates) > 0 {
+		// pop closest candidate
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i].Score < candidates[j].Score })
+		c := candidates[0]
+		candidates = candidates[1:]
+
+		// get furthest in result set
+		sort.Slice(resultSet, func(i, j int) bool { return resultSet[i].Score < resultSet[j].Score })
+		furthest := resultSet[len(resultSet)-1]
+
+		if c.Score > furthest.Score {
+			break
+		}
+
+		entry := h.graph[c.ID]
+		if layer < len(entry.Neighbors) {
+			for _, nID := range entry.Neighbors[layer] {
+				if visited[nID] {
+					continue
+				}
+				visited[nID] = true
+
+				if nVec, ok := h.vectors[nID]; ok {
+					d := h.hnswDistance(query, nVec.Values)
+
+					sort.Slice(resultSet, func(i, j int) bool { return resultSet[i].Score < resultSet[j].Score })
+					if d < resultSet[len(resultSet)-1].Score || len(resultSet) < ef {
+						resultSet = append(resultSet, searchCandidate{ID: nID, Score: d})
+						candidates = append(candidates, searchCandidate{ID: nID, Score: d})
+
+						if len(resultSet) > ef {
+							sort.Slice(resultSet, func(i, j int) bool { return resultSet[i].Score < resultSet[j].Score })
+							resultSet = resultSet[:ef]
+						}
+					}
+				}
+			}
+		}
+	}
+
+	sort.Slice(resultSet, func(i, j int) bool { return resultSet[i].Score < resultSet[j].Score })
+	return resultSet
+}
+
+// selectNeighbors selects top M neighbors from candidates.
+func (h *HNSWIndex) selectNeighbors(queryValues []float32, candidates []searchCandidate, M int) []string {
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Score < candidates[j].Score })
+	if len(candidates) > M {
+		candidates = candidates[:M]
+	}
+	result := make([]string, len(candidates))
+	for i, c := range candidates {
+		result[i] = c.ID
+	}
+	return result
+}
+
+// makeCandidates creates candidate list from IDs.
+func (h *HNSWIndex) makeCandidates(neighborIDs []string, queryValues []float32) []searchCandidate {
+	candidates := make([]searchCandidate, 0, len(neighborIDs))
+	for _, id := range neighborIDs {
+		if v, ok := h.vectors[id]; ok {
+			candidates = append(candidates, searchCandidate{
+				ID:    id,
+				Score: h.hnswDistance(queryValues, v.Values),
+			})
+		}
+	}
+	return candidates
+}
+
+// insertIntoGraph is the core HNSW insert algorithm.
+func (h *HNSWIndex) insertIntoGraph(id string, values []float32, level int) {
+	ep := h.entryPoint
+	epEntry := h.graph[ep]
+	L := epEntry.Level
+
+	// Phase 1: greedy descent from top layer to level+1
+	for l := L; l > level; l-- {
+		ep = h.greedyClosest(values, ep, l)
+	}
+
+	// Phase 2: search and connect from min(level, L) down to 0
+	for l := minInt(level, L); l >= 0; l-- {
+		candidates := h.searchLayer(values, ep, h.efConstruction, l)
+
+		maxConn := h.M
+		if l == 0 {
+			maxConn = h.maxM0
+		}
+
+		neighbors := h.selectNeighbors(values, candidates, maxConn)
+
+		// Set neighbors for new node at this layer
+		h.graph[id].Neighbors[l] = neighbors
+
+		// Add bidirectional connections
+		for _, nID := range neighbors {
+			nEntry := h.graph[nID]
+			if l < len(nEntry.Neighbors) {
+				nEntry.Neighbors[l] = append(nEntry.Neighbors[l], id)
+
+				// Prune if exceeds max connections
+				if len(nEntry.Neighbors[l]) > maxConn {
+					nCands := h.makeCandidates(nEntry.Neighbors[l], h.vectors[nID].Values)
+					nEntry.Neighbors[l] = h.selectNeighbors(h.vectors[nID].Values, nCands, maxConn)
+				}
+			}
+		}
+
+		// Update entry point for next layer
+		if len(candidates) > 0 {
+			ep = candidates[0].ID
+		}
+	}
+
+	// Update entry point if new node has higher level
+	if level > L {
+		h.entryPoint = id
 	}
 }
 
@@ -291,9 +495,39 @@ func (h *HNSWIndex) Delete(ctx context.Context, ids []string) error {
 
 	for _, id := range ids {
 		if _, ok := h.vectors[id]; ok {
+			// Remove from all neighbor lists of other nodes
+			entry := h.graph[id]
+			for l := 0; l <= entry.Level; l++ {
+				for _, nID := range entry.Neighbors[l] {
+					if nEntry, ok := h.graph[nID]; ok {
+						if l < len(nEntry.Neighbors) {
+							filtered := make([]string, 0, len(nEntry.Neighbors[l]))
+							for _, nid := range nEntry.Neighbors[l] {
+								if nid != id {
+									filtered = append(filtered, nid)
+								}
+							}
+							nEntry.Neighbors[l] = filtered
+						}
+					}
+				}
+			}
+
 			delete(h.vectors, id)
 			delete(h.graph, id)
 			h.stats.TotalVectors--
+
+			// If was entry point, find new entry point (highest level node)
+			if h.entryPoint == id {
+				h.entryPoint = ""
+				maxL := -1
+				for nid, nEntry := range h.graph {
+					if nEntry.Level > maxL {
+						maxL = nEntry.Level
+						h.entryPoint = nid
+					}
+				}
+			}
 		}
 	}
 
@@ -325,21 +559,27 @@ type searchCandidate struct {
 }
 
 type IVFPQIndex struct {
-	mu                sync.RWMutex
-	vectors           map[string]*Vector
-	clusters          []centroid
-	clusterAssignments map[string]int
-	codebooks         [][]float32
-	dim               int
-	numClusters       int
-	productQuantization int
-	metric            MetricType
-	stats             IndexStats
+	mu                 sync.RWMutex
+	vectors            map[string]*Vector
+	clusters           []centroid
+	clusterAssignments map[string]int   // vector ID -> cluster index
+	invertedLists      map[int][]string // cluster index -> list of vector IDs
+	codebooks          [][][]float32    // [subquantizer][256][subDim] PQ codebooks
+	pqCodes            map[string][]uint8 // vector ID -> PQ codes
+	dim                int
+	numClusters        int
+	numSubquantizers   int
+	subDim             int // dim / numSubquantizers
+	nprobe             int // number of clusters to search
+	metric             MetricType
+	trained            bool
+	stats              IndexStats
 }
 
 type centroid struct {
 	Center []float32
 	Count  int
+	IDs    []string // vector IDs in this cluster
 }
 
 func NewIVFPQIndex(dim, numClusters, pqSize int, metric MetricType) (*IVFPQIndex, error) {
@@ -351,15 +591,33 @@ func NewIVFPQIndex(dim, numClusters, pqSize int, metric MetricType) (*IVFPQIndex
 		metric = MetricCosine
 	}
 
+	subDim := dim / pqSize
+	if subDim < 1 {
+		subDim = 1
+	}
+
+	nprobe := numClusters
+	if nprobe > 10 {
+		nprobe = 10
+	}
+	if nprobe < 1 {
+		nprobe = 1
+	}
+
 	return &IVFPQIndex{
 		vectors:            make(map[string]*Vector),
 		clusters:           make([]centroid, numClusters),
 		clusterAssignments: make(map[string]int),
-		codebooks:          make([][]float32, pqSize),
+		invertedLists:      make(map[int][]string),
+		codebooks:          make([][][]float32, pqSize),
+		pqCodes:            make(map[string][]uint8),
 		dim:                dim,
 		numClusters:        numClusters,
-		productQuantization: pqSize,
+		numSubquantizers:   pqSize,
+		subDim:             subDim,
+		nprobe:             nprobe,
 		metric:             metric,
+		trained:            false,
 		stats: IndexStats{
 			Dimension: dim,
 			IndexType: "IVF-PQ",
@@ -383,46 +641,26 @@ func (ivf *IVFPQIndex) Insert(ctx context.Context, vectors []Vector) error {
 			v.CreatedAt = time.Now()
 		}
 
+		if len(v.Values) != ivf.dim {
+			return fmt.Errorf("vector dimension mismatch: expected %d, got %d", ivf.dim, len(v.Values))
+		}
+
 		ivf.vectors[v.ID] = v
 
-		clusterIdx := ivf.assignToNearestCluster(v.Values)
-		ivf.clusterAssignments[v.ID] = clusterIdx
-		ivf.clusters[clusterIdx].Count++
+		if ivf.trained {
+			clusterIdx := ivf.assignToCluster(v.Values)
+			ivf.clusterAssignments[v.ID] = clusterIdx
+			ivf.invertedLists[clusterIdx] = append(ivf.invertedLists[clusterIdx], v.ID)
+			ivf.clusters[clusterIdx].IDs = append(ivf.clusters[clusterIdx].IDs, v.ID)
+			ivf.clusters[clusterIdx].Count++
+			codes := ivf.encodePQ(v.Values)
+			ivf.pqCodes[v.ID] = codes
+		}
 
 		ivf.stats.TotalVectors++
 	}
 
 	return nil
-}
-
-func (ivf *IVFPQIndex) assignToNearestCluster(values []float32) int {
-	minDist := float32(math.MaxFloat32)
-	bestCluster := 0
-
-	for i, c := range ivf.clusters {
-		if len(c.Center) == 0 {
-			ivf.clusters[i].Center = make([]float32, len(values))
-			copy(ivf.clusters[i].Center, values)
-			return i
-		}
-
-		var dist float32
-		switch ivf.metric {
-		case MetricEuclidean:
-			dist = euclideanDistance(values, c.Center)
-		case MetricCosine:
-			dist = 1 - cosineSimilarity(values, c.Center)
-		case MetricDotProduct:
-			dist = -dotProduct(values, c.Center)
-		}
-
-		if dist < minDist {
-			minDist = dist
-			bestCluster = i
-		}
-	}
-
-	return bestCluster
 }
 
 func (ivf *IVFPQIndex) Search(ctx context.Context, query Vector, topK int, filters map[string]string) ([]SearchResult, error) {
@@ -435,6 +673,169 @@ func (ivf *IVFPQIndex) Search(ctx context.Context, query Vector, topK int, filte
 		return nil, ErrInvalidDimension
 	}
 
+	if !ivf.trained || len(ivf.vectors) == 0 {
+		// Fall back to brute-force search
+		return ivf.bruteForceSearch(query, topK, filters, startTime)
+	}
+
+	// Find nprobe nearest clusters to query
+	type clusterDist struct {
+		idx  int
+		dist float32
+	}
+	clusterDists := make([]clusterDist, 0, len(ivf.clusters))
+	for i, c := range ivf.clusters {
+		if len(c.Center) == 0 {
+			continue
+		}
+		dist := ivf.ivfDistance(query.Values, c.Center)
+		clusterDists = append(clusterDists, clusterDist{idx: i, dist: dist})
+	}
+
+	sort.Slice(clusterDists, func(i, j int) bool {
+		return clusterDists[i].dist < clusterDists[j].dist
+	})
+
+	if len(clusterDists) > ivf.nprobe {
+		clusterDists = clusterDists[:ivf.nprobe]
+	}
+
+	// Precompute PQ distance tables if PQ is trained
+	pqReady := len(ivf.codebooks) > 0 && len(ivf.codebooks[0]) > 0
+	var distTables [][]float32 // [subquantizer][256]
+	if pqReady {
+		distTables = make([][]float32, ivf.numSubquantizers)
+		for s := 0; s < ivf.numSubquantizers; s++ {
+			distTables[s] = make([]float32, 256)
+			start := s * ivf.subDim
+			end := start + ivf.subDim
+			if end > len(query.Values) {
+				end = len(query.Values)
+			}
+			querySub := query.Values[start:end]
+			for c := 0; c < len(ivf.codebooks[s]); c++ {
+				distTables[s][c] = ivf.ivfDistance(querySub, ivf.codebooks[s][c])
+			}
+		}
+	}
+
+	// Collect candidates from nprobe clusters
+	type candidate struct {
+		id    string
+		dist  float32
+		vec   *Vector
+	}
+	candidates := make([]candidate, 0)
+	seen := make(map[string]bool)
+
+	for _, cd := range clusterDists {
+		ids, ok := ivf.invertedLists[cd.idx]
+		if !ok {
+			continue
+		}
+		for _, id := range ids {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+
+			v, ok := ivf.vectors[id]
+			if !ok {
+				continue
+			}
+
+			// Apply metadata filters
+			if len(filters) > 0 {
+				match := true
+				for k, val := range filters {
+					if v.Metadata == nil {
+						match = false
+						break
+					}
+					if v.Metadata[k] != val {
+						match = false
+						break
+					}
+				}
+				if !match {
+					continue
+				}
+			}
+
+			var dist float32
+			if pqReady {
+				codes, hasCode := ivf.pqCodes[id]
+				if hasCode {
+					dist = ivf.pqApproximateDistance(distTables, codes)
+				} else {
+					dist = ivf.ivfDistance(query.Values, v.Values)
+				}
+			} else {
+				dist = ivf.ivfDistance(query.Values, v.Values)
+			}
+
+			candidates = append(candidates, candidate{id: id, dist: dist, vec: v})
+		}
+	}
+
+	// If we got fewer candidates than topK, also scan remaining clusters
+	if len(candidates) < topK {
+		for id, v := range ivf.vectors {
+			if seen[id] {
+				continue
+			}
+
+			if len(filters) > 0 {
+				match := true
+				for k, val := range filters {
+					if v.Metadata == nil {
+						match = false
+						break
+					}
+					if v.Metadata[k] != val {
+						match = false
+						break
+					}
+				}
+				if !match {
+					continue
+				}
+			}
+
+			dist := ivf.ivfDistance(query.Values, v.Values)
+			candidates = append(candidates, candidate{id: id, dist: dist, vec: v})
+		}
+	}
+
+	// Convert distances to similarity scores and sort
+	results := make([]SearchResult, 0, len(candidates))
+	for _, c := range candidates {
+		score := ivf.ivfSimilarityScore(c.dist)
+		results = append(results, SearchResult{
+			ID:        c.id,
+			Score:     score,
+			Metadata:  c.vec.Metadata,
+			Bucket:    c.vec.Bucket,
+			ObjectKey: c.vec.ObjectKey,
+		})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+
+	if len(results) > topK {
+		results = results[:topK]
+	}
+
+	ivf.stats.QueryCount++
+	latency := time.Since(startTime).Seconds() * 1000
+	ivf.stats.AvgLatencyMs = (ivf.stats.AvgLatencyMs*float64(ivf.stats.QueryCount-1) + latency) / float64(ivf.stats.QueryCount)
+
+	return results, nil
+}
+
+func (ivf *IVFPQIndex) bruteForceSearch(query Vector, topK int, filters map[string]string, startTime time.Time) ([]SearchResult, error) {
 	var results []SearchResult
 
 	for id, v := range ivf.vectors {
@@ -455,7 +856,8 @@ func (ivf *IVFPQIndex) Search(ctx context.Context, query Vector, topK int, filte
 			}
 		}
 
-		score := calculateDistance(ivf.metric, query.Values, v.Values)
+		dist := ivf.ivfDistance(query.Values, v.Values)
+		score := ivf.ivfSimilarityScore(dist)
 		results = append(results, SearchResult{
 			ID:        id,
 			Score:     score,
@@ -480,30 +882,36 @@ func (ivf *IVFPQIndex) Search(ctx context.Context, query Vector, topK int, filte
 	return results, nil
 }
 
-func calculateDistance(metric MetricType, a, b []float32) float32 {
-	switch metric {
-	case MetricCosine:
-		return cosineSimilarity(a, b)
-	case MetricEuclidean:
-		return euclideanDistance(a, b)
-	case MetricDotProduct:
-		return dotProduct(a, b)
-	default:
-		return cosineSimilarity(a, b)
-	}
-}
-
 func (ivf *IVFPQIndex) Delete(ctx context.Context, ids []string) error {
 	ivf.mu.Lock()
 	defer ivf.mu.Unlock()
 
 	for _, id := range ids {
 		if clusterIdx, ok := ivf.clusterAssignments[id]; ok {
+			// Remove from invertedLists
+			il := ivf.invertedLists[clusterIdx]
+			for j, vid := range il {
+				if vid == id {
+					ivf.invertedLists[clusterIdx] = append(il[:j], il[j+1:]...)
+					break
+				}
+			}
+			// Remove from cluster IDs
+			cids := ivf.clusters[clusterIdx].IDs
+			for j, cid := range cids {
+				if cid == id {
+					ivf.clusters[clusterIdx].IDs = append(cids[:j], cids[j+1:]...)
+					break
+				}
+			}
 			ivf.clusters[clusterIdx].Count--
+			delete(ivf.clusterAssignments, id)
 		}
-		delete(ivf.vectors, id)
-		delete(ivf.clusterAssignments, id)
-		ivf.stats.TotalVectors--
+		delete(ivf.pqCodes, id)
+		if _, ok := ivf.vectors[id]; ok {
+			delete(ivf.vectors, id)
+			ivf.stats.TotalVectors--
+		}
 	}
 
 	return nil
@@ -513,15 +921,87 @@ func (ivf *IVFPQIndex) Build(ctx context.Context) error {
 	ivf.mu.Lock()
 	defer ivf.mu.Unlock()
 
-	for i := range ivf.clusters {
-		if ivf.clusters[i].Count > 0 && len(ivf.clusters[i].Center) > 0 {
-			count := float32(ivf.clusters[i].Count)
-			for j := range ivf.clusters[i].Center {
-				ivf.clusters[i].Center[j] /= count
-			}
-		}
+	if len(ivf.vectors) == 0 {
+		ivf.stats.LastBuiltAt = time.Now()
+		return nil
 	}
 
+	// Collect all vectors
+	allIDs := make([]string, 0, len(ivf.vectors))
+	allVecs := make([][]float32, 0, len(ivf.vectors))
+	for id, v := range ivf.vectors {
+		allIDs = append(allIDs, id)
+		allVecs = append(allVecs, v.Values)
+	}
+
+	numVecs := len(allVecs)
+	k := ivf.numClusters
+	if k > numVecs {
+		k = numVecs
+	}
+
+	// K-Means training for cluster centers
+	centers := ivf.kmeansTrain(allVecs, k, 20)
+
+	// Assign each vector to nearest cluster center
+	ivf.clusters = make([]centroid, k)
+	for i := range ivf.clusters {
+		ivf.clusters[i].Center = centers[i]
+		ivf.clusters[i].IDs = make([]string, 0)
+	}
+
+	ivf.clusterAssignments = make(map[string]int)
+	ivf.invertedLists = make(map[int][]string)
+
+	for i, id := range allIDs {
+		vec := allVecs[i]
+		bestCluster := 0
+		bestDist := float32(math.MaxFloat32)
+		for ci, c := range ivf.clusters {
+			d := ivf.ivfDistance(vec, c.Center)
+			if d < bestDist {
+				bestDist = d
+				bestCluster = ci
+			}
+		}
+		ivf.clusterAssignments[id] = bestCluster
+		ivf.invertedLists[bestCluster] = append(ivf.invertedLists[bestCluster], id)
+		ivf.clusters[bestCluster].IDs = append(ivf.clusters[bestCluster].IDs, id)
+		ivf.clusters[bestCluster].Count++
+	}
+
+	// PQ training
+	pqK := 256
+	if numVecs < pqK {
+		pqK = numVecs
+	}
+
+	ivf.codebooks = make([][][]float32, ivf.numSubquantizers)
+	for s := 0; s < ivf.numSubquantizers; s++ {
+		start := s * ivf.subDim
+		end := start + ivf.subDim
+		if end > ivf.dim {
+			end = ivf.dim
+		}
+
+		// Extract sub-vectors
+		subVecs := make([][]float32, numVecs)
+		for j, vec := range allVecs {
+			subVecs[j] = vec[start:end]
+		}
+
+		// Run K-Means on sub-vectors
+		codebook := ivf.kmeansTrain(subVecs, pqK, 20)
+		ivf.codebooks[s] = codebook
+	}
+
+	// Encode all vectors into PQ codes
+	ivf.pqCodes = make(map[string][]uint8)
+	for i, id := range allIDs {
+		ivf.pqCodes[id] = ivf.encodePQ(allVecs[i])
+	}
+
+	ivf.trained = true
 	ivf.stats.LastBuiltAt = time.Now()
 
 	return nil
@@ -532,6 +1012,163 @@ func (ivf *IVFPQIndex) GetStats() IndexStats {
 	defer ivf.mu.RUnlock()
 
 	return ivf.stats
+}
+
+// ivfDistance computes a distance where lower = more similar.
+// For cosine: 1 - cosineSimilarity
+// For euclidean: euclidean distance
+// For dot_product: -dotProduct
+func (ivf *IVFPQIndex) ivfDistance(a, b []float32) float32 {
+	switch ivf.metric {
+	case MetricCosine:
+		return 1 - cosineSimilarity(a, b)
+	case MetricEuclidean:
+		return euclideanDistance(a, b)
+	case MetricDotProduct:
+		return -dotProduct(a, b)
+	default:
+		return 1 - cosineSimilarity(a, b)
+	}
+}
+
+// ivfSimilarityScore converts a distance (lower = more similar) to a similarity score (higher = more similar).
+func (ivf *IVFPQIndex) ivfSimilarityScore(dist float32) float32 {
+	switch ivf.metric {
+	case MetricCosine:
+		return 1 - dist // back to cosine similarity
+	case MetricEuclidean:
+		return 1 / (1 + dist) // inverse distance
+	case MetricDotProduct:
+		return -dist // back to dot product
+	default:
+		return 1 - dist
+	}
+}
+
+// assignToCluster finds the nearest cluster for a given vector.
+func (ivf *IVFPQIndex) assignToCluster(values []float32) int {
+	bestCluster := 0
+	bestDist := float32(math.MaxFloat32)
+	for i, c := range ivf.clusters {
+		if len(c.Center) == 0 {
+			continue
+		}
+		d := ivf.ivfDistance(values, c.Center)
+		if d < bestDist {
+			bestDist = d
+			bestCluster = i
+		}
+	}
+	return bestCluster
+}
+
+// encodePQ encodes a vector into PQ codes.
+func (ivf *IVFPQIndex) encodePQ(values []float32) []uint8 {
+	codes := make([]uint8, ivf.numSubquantizers)
+	for s := 0; s < ivf.numSubquantizers; s++ {
+		start := s * ivf.subDim
+		end := start + ivf.subDim
+		if end > len(values) {
+			end = len(values)
+		}
+		subVec := values[start:end]
+
+		bestCode := uint8(0)
+		bestDist := float32(math.MaxFloat32)
+		for c, centroid := range ivf.codebooks[s] {
+			d := ivf.ivfDistance(subVec, centroid)
+			if d < bestDist {
+				bestDist = d
+				bestCode = uint8(c)
+			}
+		}
+		codes[s] = bestCode
+	}
+	return codes
+}
+
+// pqApproximateDistance computes approximate distance using precomputed PQ distance tables.
+func (ivf *IVFPQIndex) pqApproximateDistance(distTables [][]float32, codes []uint8) float32 {
+	var totalDist float32
+	for s := 0; s < ivf.numSubquantizers && s < len(codes); s++ {
+		if int(codes[s]) < len(distTables[s]) {
+			totalDist += distTables[s][codes[s]]
+		}
+	}
+	return totalDist
+}
+
+// kmeansTrain runs K-Means clustering and returns cluster centers.
+func (ivf *IVFPQIndex) kmeansTrain(data [][]float32, k int, maxIter int) [][]float32 {
+	n := len(data)
+	if n == 0 || k <= 0 {
+		return nil
+	}
+	if k > n {
+		k = n
+	}
+
+	dim := len(data[0])
+
+	// Initialize centers by picking k random vectors
+	perm := globalRand.Perm(n)
+	centers := make([][]float32, k)
+	for i := 0; i < k; i++ {
+		centers[i] = make([]float32, dim)
+		copy(centers[i], data[perm[i]])
+	}
+
+	assignments := make([]int, n)
+
+	for iter := 0; iter < maxIter; iter++ {
+		// Assignment step
+		changed := false
+		for i, vec := range data {
+			bestCluster := 0
+			bestDist := float32(math.MaxFloat32)
+			for ci, center := range centers {
+				d := ivf.ivfDistance(vec, center)
+				if d < bestDist {
+					bestDist = d
+					bestCluster = ci
+				}
+			}
+			if assignments[i] != bestCluster {
+				assignments[i] = bestCluster
+				changed = true
+			}
+		}
+
+		if !changed {
+			break
+		}
+
+		// Update step: recompute centers
+		counts := make([]int, k)
+		sums := make([][]float32, k)
+		for i := range sums {
+			sums[i] = make([]float32, dim)
+		}
+
+		for i, vec := range data {
+			c := assignments[i]
+			counts[c]++
+			for j := range vec {
+				sums[c][j] += vec[j]
+			}
+		}
+
+		for i := 0; i < k; i++ {
+			if counts[i] > 0 {
+				for j := range centers[i] {
+					centers[i][j] = sums[i][j] / float32(counts[i])
+				}
+			}
+			// If a cluster has no members, keep its center unchanged
+		}
+	}
+
+	return centers
 }
 
 type VectorManager struct {
@@ -561,6 +1198,13 @@ type VectorConfig struct {
 	EmbeddingAPIEndpoint string
 	EmbeddingAPIKey     string
 	EmbeddingModelName  string
+	// Security settings
+	AutoIndex           bool
+	MaxSearchTopK       int
+	MaxQueryLength      int
+	RequireAuth         bool
+	AllowedContentTypes []string
+	MaxIndexContentSize int64
 }
 
 type QueryCache struct {
@@ -965,6 +1609,31 @@ func DecodeVector(data []byte) []float32 {
 	}
 
 	return v
+}
+
+// IsTextContent checks if a content type is suitable for text-based embedding.
+// Exported for use in gateway and tests.
+func IsTextContent(contentType string) bool {
+	textPrefixes := []string{
+		"text/",
+		"application/json",
+		"application/xml",
+		"application/javascript",
+		"application/x-yaml",
+		"application/markdown",
+	}
+	for _, prefix := range textPrefixes {
+		if strings.HasPrefix(contentType, prefix) {
+			return true
+		}
+	}
+	textSuffixes := []string{"+json", "+xml", "+yaml"}
+	for _, suffix := range textSuffixes {
+		if strings.Contains(contentType, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func GenerateEmbedding(text string, dim int) []float32 {

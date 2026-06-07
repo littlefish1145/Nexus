@@ -375,8 +375,8 @@ func (h *MultipartUploadHandler) HandleCompleteMultipartUpload(w http.ResponseWr
 		h.gateway.tiering.RecordAccess(r.Context(), bucket, key, "PUT", upload.UserID)
 	}
 
-	if h.gateway.vector != nil {
-		go h.gateway.vectorizeObject(r.Context(), bucket, key, upload.ContentType)
+	if h.gateway.vector != nil && h.gateway.config.Vector.Enabled {
+		go h.gateway.vectorizeObject(r.Context(), bucket, key, upload.ContentType, upload.Metadata, upload.UserID)
 	}
 
 	if h.gateway.pipeline != nil {

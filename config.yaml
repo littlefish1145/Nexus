@@ -57,6 +57,12 @@ vector:
   embedding_api_endpoint: ""
   embedding_api_key: ""
   embedding_model_name: ""
+  # Security settings
+  auto_index: true              # Auto-index text files on upload when vector is enabled
+  max_search_top_k: 100         # Maximum topK allowed in search queries
+  max_query_length: 10000       # Maximum search query length in characters
+  require_auth: true            # Require authentication for vector search API
+  max_index_content_size: 1048576  # Maximum content size to index (1MB)
 
 pipelines:
   config_file: "./pipelines.yaml"

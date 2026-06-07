@@ -142,6 +142,12 @@ type VectorConfig struct {
 	EmbeddingAPIEndpoint string `mapstructure:"embedding_api_endpoint"`
 	EmbeddingAPIKey      string `mapstructure:"embedding_api_key"`
 	EmbeddingModelName   string `mapstructure:"embedding_model_name"`
+	AutoIndex            bool   `mapstructure:"auto_index"`
+	MaxSearchTopK        int    `mapstructure:"max_search_top_k"`
+	MaxQueryLength       int    `mapstructure:"max_query_length"`
+	RequireAuth          bool   `mapstructure:"require_auth"`
+	AllowedContentTypes  []string `mapstructure:"allowed_content_types"`
+	MaxIndexContentSize  int64  `mapstructure:"max_index_content_size"`
 }
 
 type PipelineConfig struct {
@@ -195,6 +201,11 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("vector.enabled", true)
 	viper.SetDefault("vector.dim", 768)
 	viper.SetDefault("vector.hot_index_size", "10GB")
+	viper.SetDefault("vector.auto_index", true)
+	viper.SetDefault("vector.max_search_top_k", 100)
+	viper.SetDefault("vector.max_query_length", 10000)
+	viper.SetDefault("vector.require_auth", true)
+	viper.SetDefault("vector.max_index_content_size", 1048576) // 1MB
 	viper.SetDefault("cache.policy", "tinyLFU")
 	viper.SetDefault("cache.metadata_max_size", "10GB")
 	viper.SetDefault("cache.object_max_size", "30GB")

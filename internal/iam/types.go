@@ -1,6 +1,7 @@
 package iam
 
 import (
+	"strings"
 	"time"
 )
 
@@ -10,6 +11,7 @@ const (
 	ServiceS3    = "s3"
 	ServiceIAM   = "iam"
 	ServiceSTS   = "sts"
+	ServiceVector = "vector"
 
 	// Access key ID prefix (AWS compatible)
 	AccessKeyIDPrefix = "AKIA"
@@ -215,3 +217,27 @@ func MakeBucketARN(bucketName string) string {
 func MakeObjectARN(bucketName, objectKey string) string {
 	return MakeARN(ServiceS3, bucketName+"/"+objectKey)
 }
+
+// MakeVectorIndexARN creates a vector index ARN for a bucket
+func MakeVectorIndexARN(bucketName string) string {
+	return MakeARN(ServiceVector, "index/"+bucketName)
+}
+
+// MakeVectorDocARN creates a vector document ARN for an indexed object
+func MakeVectorDocARN(bucketName, objectKey string) string {
+	return MakeARN(ServiceVector, "index/"+bucketName+"/"+objectKey)
+}
+
+// IsVectorAction checks if an action is a vector service action
+func IsVectorAction(action string) bool {
+	return strings.HasPrefix(action, ServiceVector+":")
+}
+
+// Well-known vector service actions
+const (
+	VectorActionSearch  = "vector:Search"
+	VectorActionIndex   = "vector:Index"
+	VectorActionDelete  = "vector:Delete"
+	VectorActionManage  = "vector:Manage"  // rebuild, config
+	VectorActionAll     = "vector:*"
+)

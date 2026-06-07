@@ -1113,8 +1113,11 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		g.tiering.RecordAccess(r.Context(), bucket, key, "PUT", userID)
 	}
 
-	if g.vector != nil && r.Header.Get("X-Vectorize") == "true" {
-		go g.vectorizeObject(r.Context(), bucket, key, contentType)
+	if g.vector != nil && g.config.Vector.Enabled {
+		// Auto-index when vector search is enabled; skip if client explicitly opts out
+		if r.Header.Get("X-Vectorize") != "false" {
+			go g.vectorizeObject(r.Context(), bucket, key, contentType, metadataMap, userID)
+		}
 	}
 
 	if g.pipeline != nil {
@@ -1547,8 +1550,51 @@ type SearchResultItem struct {
 }
 
 func (g *S3Gateway) handleVectorSearch(w http.ResponseWriter, r *http.Request) error {
+	// Security: Require authentication for vector search
+	user, err := g.auth.RequireAuth(r, "read")
+	if err != nil {
+		return fmt.Errorf("vector search requires authentication: %w", err)
+	}
+
+	// Security: Check vector:Search permission via IAM
+	if g.iamBridge != nil {
+		if err := g.iamBridge.CheckIAMAccess(nil, "vector:Search", "", "", r); err != nil {
+			// Fall back to legacy permission check
+			if user.Role != "admin" {
+				hasVectorPerm := false
+				for _, p := range user.Permissions {
+					if p == "vector:Search" || p == "vector:*" || p == "read" || p == "admin" {
+						hasVectorPerm = true
+						break
+					}
+				}
+				if !hasVectorPerm {
+					return fmt.Errorf("access denied: vector:Search permission required")
+				}
+			}
+		}
+	}
+
+	// Security: Rate limit vector search requests
+	if g.rateLimiter != nil {
+		clientIP := extractClientIP(r)
+		result := g.rateLimiter.Allow(r.Context(), clientIP, user.ID, "", "VECTOR_SEARCH", 0)
+		if !result.Allowed {
+			return fmt.Errorf("vector search rate limit exceeded for user %s", user.ID)
+		}
+	}
+
 	query := r.URL.Query()
 	searchQuery := query.Get("vector_search")
+	if searchQuery == "" {
+		return fmt.Errorf("missing vector_search query parameter")
+	}
+
+	// Security: Limit query length to prevent abuse
+	if len(searchQuery) > 10000 {
+		return fmt.Errorf("search query too long: maximum 10000 characters")
+	}
+
 	topKStr := query.Get("top_k")
 	thresholdStr := query.Get("threshold")
 
@@ -1557,6 +1603,14 @@ func (g *S3Gateway) handleVectorSearch(w http.ResponseWriter, r *http.Request) e
 		if k, err := strconv.Atoi(topKStr); err == nil {
 			topK = k
 		}
+	}
+
+	// Security: Cap topK to prevent resource exhaustion
+	if topK > 100 {
+		topK = 100
+	}
+	if topK <= 0 {
+		topK = 1
 	}
 
 	threshold := float32(0.7)
@@ -1578,53 +1632,129 @@ func (g *S3Gateway) handleVectorSearch(w http.ResponseWriter, r *http.Request) e
 		}
 	}
 
-	vec := vector.GenerateEmbedding(searchQuery, 768)
-
-	searchResult, err := g.vector.Search(r.Context(), vector.Vector{Values: vec}, topK, filters)
-	if err != nil {
-		return fmt.Errorf("vector search failed: %w", err)
-	}
-
-	results := make([]SearchResultItem, 0)
-	for _, r := range searchResult {
-		if r.Score >= threshold {
-			results = append(results, SearchResultItem{
-				Key:      r.ObjectKey,
-				Score:    r.Score,
-				Metadata: r.Metadata,
-			})
+	// Security: If user is not admin, restrict search to buckets they can read
+	if user.Role != "admin" && g.iamBridge != nil {
+		if bucketFilter := filters["bucket"]; bucketFilter != "" {
+			if err := g.iamBridge.CheckIAMAccess(nil, "s3:GetObject", bucketFilter, "", r); err != nil {
+				return fmt.Errorf("access denied: no read permission on bucket %s", bucketFilter)
+			}
 		}
 	}
 
 	startTime := time.Now()
+
+	searchResult, err := g.vector.SearchByText(r.Context(), searchQuery, topK, filters)
+	if err != nil {
+		return fmt.Errorf("vector search failed: %w", err)
+	}
+
+	// Security: Filter results to only include objects the user can access
+	results := make([]SearchResultItem, 0)
+	for _, r := range searchResult {
+		if r.Score < threshold {
+			continue
+		}
+		// Non-admin users can only see results from buckets they have read access to
+		if user.Role != "admin" && g.iamBridge != nil {
+			if err := g.iamBridge.CheckIAMAccess(nil, "s3:GetObject", r.Bucket, r.ObjectKey, nil); err != nil {
+				continue
+			}
+		}
+		results = append(results, SearchResultItem{
+			Key:      r.ObjectKey,
+			Score:    r.Score,
+			Metadata: r.Metadata,
+		})
+	}
+
 	response := VectorSearchResponse{
 		Results:   results,
 		LatencyMs: time.Since(startTime).Milliseconds(),
 		IndexUsed: "hot",
 	}
 
+	// Security: Audit log for vector search
+	userID := "anonymous"
+	if user != nil {
+		userID = user.ID
+	}
+	g.auditLog(r, "VECTOR_SEARCH", "", "", userID, "success", map[string]interface{}{
+		"query":    truncateString(searchQuery, 200),
+		"top_k":    topK,
+		"results":  len(results),
+		"latency_ms": response.LatencyMs,
+	})
+
 	return g.writeJSON(w, http.StatusOK, response)
 }
 
 func (g *S3Gateway) handleVectorSearchForObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	// Security: Require authentication and bucket-level read access
+	if _, err := g.auth.RequireAuthForBucket(r, bucket, "read"); err != nil {
+		return fmt.Errorf("access denied: %w", err)
+	}
 	return g.handleVectorSearch(w, r)
 }
 
-func (g *S3Gateway) vectorizeObject(ctx context.Context, bucket, key, contentType string) {
-	vec := vector.GenerateEmbedding(key, 768)
+// truncateString truncates a string to maxLen characters
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
 
-	v := &vector.Vector{
-		Bucket:    bucket,
-		ObjectKey: key,
-		Values:    vec,
-		Dimension: 768,
-		Metadata: map[string]string{
-			"content_type": contentType,
-		},
-		CreatedAt: time.Now(),
+// vectorizeObject reads object content and indexes it for vector search.
+// Only text-based content types are indexed; binary files are skipped.
+func (g *S3Gateway) vectorizeObject(ctx context.Context, bucket, key, contentType string, metadataMap map[string]string, userID string) {
+	// Only index text-based content types
+	if !vector.IsTextContent(contentType) {
+		return
 	}
 
-	g.vector.IndexVector(ctx, v)
+	// Read object content for embedding generation
+	objMeta, err := g.metadata.GetObject(ctx, bucket, key)
+	if err != nil {
+		return
+	}
+
+	storageTier := common.StorageTier(objMeta.StorageTier)
+	reader, _, err := g.store.Get(ctx, bucket, key, storageTier)
+	if err != nil {
+		return
+	}
+	defer reader.Close()
+
+	// Limit text extraction to 1MB to prevent excessive memory usage
+	limitedReader := io.LimitReader(reader, 1024*1024)
+	content, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return
+	}
+
+	text := string(content)
+	if len(strings.TrimSpace(text)) == 0 {
+		return
+	}
+
+	// Merge user metadata with system metadata
+	vecMetadata := make(map[string]string)
+	for k, v := range metadataMap {
+		vecMetadata[k] = v
+	}
+	vecMetadata["content_type"] = contentType
+	vecMetadata["indexed_by"] = userID
+	vecMetadata["indexed_at"] = time.Now().Format(time.RFC3339)
+
+	err = g.vector.IndexWithEmbedding(ctx, bucket, key, text, vecMetadata)
+	if err != nil {
+		return
+	}
+
+	g.auditLog(nil, "VECTOR_INDEX", bucket, key, userID, "success", map[string]interface{}{
+		"content_type": contentType,
+		"content_size": len(content),
+	})
 }
 
 func (g *S3Gateway) triggerPipelines(ctx context.Context, bucket, key, contentType string, metadataMap map[string]string) {
