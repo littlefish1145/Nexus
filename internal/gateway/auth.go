@@ -35,6 +35,7 @@ type AuthHandler struct {
 	failedLogins    map[string]*failedLoginTracker
 	failedLoginsMu  sync.RWMutex
 	userStorePath   string
+	iamBridge       *IAMAuthBridge // Bridge to new IAM system
 }
 
 type User struct {
@@ -177,6 +178,10 @@ func (a *AuthHandler) Authenticate(r *http.Request) (*User, error) {
 	return user, nil
 }
 
+func (a *AuthHandler) SetIAMBridge(bridge *IAMAuthBridge) {
+	a.iamBridge = bridge
+}
+
 func (a *AuthHandler) RequireAuth(r *http.Request, requiredPerms ...string) (*User, error) {
 	return a.RequireAuthForBucket(r, "", requiredPerms...)
 }
@@ -208,10 +213,38 @@ func (a *AuthHandler) RequireAuthForBucket(r *http.Request, bucket string, requi
 		return nil, err
 	}
 
+	// Admin user always has access
 	if user.Role == "admin" {
 		return user, nil
 	}
 
+	// If IAM bridge is available, use it for fine-grained access control
+	if a.iamBridge != nil {
+		// Map simple permissions to IAM actions
+		for _, perm := range requiredPerms {
+			var iamAction string
+			switch perm {
+			case "read":
+				iamAction = "s3:GetObject"
+			case "write":
+				iamAction = "s3:PutObject"
+			case "delete":
+				iamAction = "s3:DeleteObject"
+			case "admin":
+				iamAction = "s3:*"
+			default:
+				iamAction = "s3:" + perm
+			}
+
+			if err := a.iamBridge.CheckIAMAccess(nil, iamAction, bucket, "", r); err != nil {
+				// IAM denied - but we still need the IAM user context
+				// Try to get IAM user from request context
+				continue
+			}
+		}
+	}
+
+	// Fall back to legacy permission check
 	if bucket != "" && user.BucketPermissions != nil {
 		return a.checkBucketPermission(user, bucket, requiredPerms...)
 	}

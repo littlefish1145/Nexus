@@ -8,19 +8,21 @@ import (
 )
 
 type Config struct {
-	Version     string          `mapstructure:"version"`
-	Node        NodeConfig      `mapstructure:"node"`
-	Tiering     TieringConfig   `mapstructure:"tiering"`
-	Encryption  EncryptionConfig `mapstructure:"encryption"`
-	Vector      VectorConfig    `mapstructure:"vector"`
-	Pipelines   PipelineConfig  `mapstructure:"pipelines"`
-	Cache       CacheConfig     `mapstructure:"cache"`
-	Performance PerformanceConfig `mapstructure:"performance"`
-	Logging     LoggingConfig   `mapstructure:"logging"`
-	Auth        AuthConfig      `mapstructure:"auth"`
-	TLS         TLSConfig       `mapstructure:"tls"`
-	RateLimit   RateLimitConfig   `mapstructure:"ratelimit"`
-	Replication ReplicationConfig `mapstructure:"replication"`
+	Version        string           `mapstructure:"version"`
+	Node           NodeConfig       `mapstructure:"node"`
+	Tiering        TieringConfig    `mapstructure:"tiering"`
+	Encryption     EncryptionConfig `mapstructure:"encryption"`
+	CryptoServices CryptoServicesConfig `mapstructure:"crypto_services"`
+	Vector         VectorConfig     `mapstructure:"vector"`
+	Pipelines      PipelineConfig   `mapstructure:"pipelines"`
+	Cache          CacheConfig      `mapstructure:"cache"`
+	Performance    PerformanceConfig `mapstructure:"performance"`
+	Logging        LoggingConfig    `mapstructure:"logging"`
+	Auth           AuthConfig       `mapstructure:"auth"`
+	IAM            IAMConfig        `mapstructure:"iam"`
+	TLS            TLSConfig        `mapstructure:"tls"`
+	RateLimit      RateLimitConfig   `mapstructure:"ratelimit"`
+	Replication    ReplicationConfig `mapstructure:"replication"`
 }
 
 type ReplicationConfig struct {
@@ -40,6 +42,14 @@ type AuthConfig struct {
 	JWTSecret      string `mapstructure:"jwt_secret"`
 	TokenExpiry    string `mapstructure:"token_expiry"`
 	RefreshExpiry  string `mapstructure:"refresh_expiry"`
+}
+
+// IAMConfig for the new IAM system
+type IAMConfig struct {
+	Enabled       bool   `mapstructure:"enabled"`
+	DBPath        string `mapstructure:"db_path"`
+	MasterKeyPath string `mapstructure:"master_key_path"`
+	STSServiceAddr string `mapstructure:"sts_service_addr"`
 }
 
 type TLSConfig struct {
@@ -95,6 +105,27 @@ type EncryptionConfig struct {
 	AWSRegion       string `mapstructure:"aws_region"`
 	EnableDedup     bool   `mapstructure:"enable_dedup"`
 	MasterKeyPath   string `mapstructure:"master_key_path"`
+}
+
+// CryptoServicesConfig for distributed crypto microservices
+type CryptoServicesConfig struct {
+	Enabled         bool   `mapstructure:"enabled"`
+	DistributedMode bool   `mapstructure:"distributed_mode"`
+	KeyPath         string `mapstructure:"key_path"`
+	KeyStorePath    string `mapstructure:"keystore_path"`
+	OPAAddress      string `mapstructure:"opa_address"`
+	ConsulAddress   string `mapstructure:"consul_address"`
+	MTLSCertFile    string `mapstructure:"mtls_cert_file"`
+	MTLSKeyFile     string `mapstructure:"mtls_key_file"`
+	MTLSCAFile      string `mapstructure:"mtls_ca_file"`
+	AuditSize       int    `mapstructure:"audit_size"`
+	// gRPC service addresses for distributed mode
+	TokenServiceAddr     string `mapstructure:"token_service_addr"`
+	KeyGenServiceAddr    string `mapstructure:"keygen_service_addr"`
+	KeyUnwrapServiceAddr string `mapstructure:"keyunwrap_service_addr"`
+	EncryptServiceAddr   string `mapstructure:"encrypt_service_addr"`
+	DecryptServiceAddr   string `mapstructure:"decrypt_service_addr"`
+	KeyStoreServiceAddr  string `mapstructure:"keystore_service_addr"`
 }
 
 type VectorConfig struct {
@@ -158,6 +189,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("tiering.hot_max_size", "32GB")
 	viper.SetDefault("encryption.enable_dedup", true)
 	viper.SetDefault("encryption.vault_transit_key", "nexus")
+	viper.SetDefault("crypto_services.enabled", false)
+	viper.SetDefault("crypto_services.distributed_mode", false)
+	viper.SetDefault("crypto_services.audit_size", 10000)
 	viper.SetDefault("vector.enabled", true)
 	viper.SetDefault("vector.dim", 768)
 	viper.SetDefault("vector.hot_index_size", "10GB")

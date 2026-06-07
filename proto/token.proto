@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package nexus.token;
+
+option go_package = "nexus/proto/token";
+
+import "common.proto";
+
+// TokenService - Issues and validates delegation tokens
+// Uses Ed25519 for signing
+
+service TokenService {
+  // Issue a write token for encryption operations
+  rpc IssueWriteToken(IssueWriteTokenRequest) returns (IssueWriteTokenResponse);
+  
+  // Issue a read token for decryption operations
+  rpc IssueReadToken(IssueReadTokenRequest) returns (IssueReadTokenResponse);
+  
+  // Issue a delete token
+  rpc IssueDeleteToken(IssueDeleteTokenRequest) returns (IssueDeleteTokenResponse);
+  
+  // Validate a token signature and expiry
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+  
+  // Get service public key for token verification
+  rpc GetPublicKey(GetPublicKeyRequest) returns (GetPublicKeyResponse);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message IssueWriteTokenRequest {
+  string user_id = 1;
+  string bucket = 2;
+  string object_key = 3;
+  int64 ttl_seconds = 4;  // Token lifetime, default 30s if 0
+}
+
+message IssueWriteTokenResponse {
+  nexus.common.DelegationToken token = 1;
+  nexus.common.Error error = 2;
+}
+
+message IssueReadTokenRequest {
+  string user_id = 1;
+  string bucket = 2;
+  string object_key = 3;
+  string content_hash = 4;  // For integrity verification
+  int64 ttl_seconds = 5;
+}
+
+message IssueReadTokenResponse {
+  nexus.common.DelegationToken token = 1;
+  nexus.common.Error error = 2;
+}
+
+message IssueDeleteTokenRequest {
+  string user_id = 1;
+  string bucket = 2;
+  string object_key = 3;
+  int64 ttl_seconds = 4;
+}
+
+message IssueDeleteTokenResponse {
+  nexus.common.DelegationToken token = 1;
+  nexus.common.Error error = 2;
+}
+
+message ValidateTokenRequest {
+  nexus.common.DelegationToken token = 1;
+  nexus.common.TokenType expected_type = 2;
+}
+
+message ValidateTokenResponse {
+  bool valid = 1;
+  string user_id = 2;
+  string bucket = 3;
+  string object_key = 4;
+  nexus.common.Error error = 5;
+}
+
+message GetPublicKeyRequest {}
+
+message GetPublicKeyResponse {
+  bytes public_key = 1;  // Ed25519 public key
+  string key_id = 2;
+  nexus.common.Error error = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string service_name = 2;
+  string version = 3;
+  int64 uptime_seconds = 4;
+}

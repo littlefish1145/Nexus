@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package nexus.encrypt;
+
+option go_package = "nexus/proto/encrypt";
+
+import "common.proto";
+
+// EncryptService - Encrypts data using DEK
+// No persistent keys - uses DEK passed in request
+// Single responsibility: data encryption only
+
+service EncryptService {
+  // Encrypt data stream
+  // Uses ECDH-derived session key to decrypt DEK, then encrypts data
+  rpc Encrypt(EncryptRequest) returns (stream EncryptResponse);
+  
+  // Encrypt a single chunk (for non-streaming use)
+  rpc EncryptChunk(EncryptChunkRequest) returns (EncryptChunkResponse);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message EncryptRequest {
+  // DEK encrypted with ECDH-derived session key
+  nexus.common.ECDHEncryptedDEK ecdh_encrypted_dek = 1;
+  
+  // Client's ECDH private key (for deriving shared secret)
+  // Note: This is passed securely via mTLS channel
+  bytes client_ecdh_private_key = 2;
+  
+  // Service's ephemeral ECDH public key from KeyGenService
+  nexus.common.ECDHPublicKey service_ecdh_pub = 3;
+  
+  // Encryption algorithm
+  string algorithm = 4;  // e.g., "AES-256-GCM"
+  
+  // Associated data for AEAD (optional)
+  bytes associated_data = 5;
+}
+
+message EncryptResponse {
+  // Encrypted data chunk
+  bytes ciphertext_chunk = 1;
+  
+  // Nonce/IV for this chunk (first chunk contains full nonce)
+  bytes nonce = 2;
+  
+  // Authentication tag (last chunk contains final tag)
+  bytes auth_tag = 3;
+  
+  // Chunk sequence number
+  int64 sequence = 4;
+  
+  // Indicates this is the last chunk
+  bool is_last = 5;
+  
+  nexus.common.Error error = 6;
+}
+
+message EncryptChunkRequest {
+  nexus.common.ECDHEncryptedDEK ecdh_encrypted_dek = 1;
+  bytes client_ecdh_private_key = 2;
+  nexus.common.ECDHPublicKey service_ecdh_pub = 3;
+  bytes plaintext = 4;
+  string algorithm = 5;
+  bytes associated_data = 6;
+}
+
+message EncryptChunkResponse {
+  bytes ciphertext = 1;
+  bytes nonce = 2;
+  bytes auth_tag = 3;
+  nexus.common.Error error = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string service_name = 2;
+  string version = 3;
+  int64 uptime_seconds = 4;
+}

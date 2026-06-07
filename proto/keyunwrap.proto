@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package nexus.keyunwrap;
+
+option go_package = "nexus/proto/keyunwrap";
+
+import "common.proto";
+import "token.proto";
+
+// KeyUnwrapService - Unwraps (decrypts) data encryption keys
+// Uses private key (SK_Decrypt) to decrypt encrypted DEK
+// Cannot encrypt - only has private key
+
+service KeyUnwrapService {
+  // Unwrap an encrypted DEK
+  // Returns ECDH-encrypted DEK for DecryptService
+  rpc UnwrapKey(UnwrapKeyRequest) returns (UnwrapKeyResponse);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message UnwrapKeyRequest {
+  nexus.common.DelegationToken token = 1;  // Must be READ token
+  nexus.common.EncryptedDEK encrypted_dek = 2;  // From KeyStore
+  nexus.common.ECDHPublicKey client_ecdh_pub = 3;  // Client's ECDH public key
+}
+
+message UnwrapKeyResponse {
+  // DEK encrypted with ECDH-derived session key (for DecryptService)
+  nexus.common.ECDHEncryptedDEK ecdh_encrypted_dek = 1;
+  
+  // Service's ephemeral ECDH public key
+  nexus.common.ECDHPublicKey service_ecdh_pub = 2;
+  
+  nexus.common.Error error = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string service_name = 2;
+  string version = 3;
+  int64 uptime_seconds = 4;
+}

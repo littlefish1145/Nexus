@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package sts;
+
+option go_package = "nexus/proto/sts";
+
+// STS Service - Security Token Service
+service STSService {
+  // AssumeRole returns temporary credentials for an assumed role
+  rpc AssumeRole(AssumeRoleRequest) returns (AssumeRoleResponse);
+  
+  // GetSessionToken returns temporary credentials for the current user
+  rpc GetSessionToken(GetSessionTokenRequest) returns (GetSessionTokenResponse);
+  
+  // GetFederationToken returns temporary credentials for a federated user
+  rpc GetFederationToken(GetFederationTokenRequest) returns (GetFederationTokenResponse);
+}
+
+message AssumeRoleRequest {
+  string role_arn = 1;
+  string role_session_name = 2;
+  int32 duration_seconds = 3;
+  string external_id = 4;
+  string policy = 5; // JSON policy to scope down permissions
+  string caller_arn = 6; // Set by the gateway
+}
+
+message AssumeRoleResponse {
+  Credentials credentials = 1;
+  string assumed_role_user_arn = 2;
+  int32 packed_policy_size = 3;
+}
+
+message GetSessionTokenRequest {
+  int32 duration_seconds = 1;
+  string caller_arn = 2;
+}
+
+message GetSessionTokenResponse {
+  Credentials credentials = 1;
+}
+
+message GetFederationTokenRequest {
+  string name = 1;
+  int32 duration_seconds = 2;
+  string policy = 3;
+  string caller_arn = 4;
+}
+
+message GetFederationTokenResponse {
+  Credentials credentials = 1;
+  string federated_user_arn = 2;
+  int32 packed_policy_size = 3;
+}
+
+message Credentials {
+  string access_key_id = 1;
+  string secret_access_key = 2;
+  string session_token = 3;
+  int64 expiration_unix = 4;
+}

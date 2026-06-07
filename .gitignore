@@ -12,6 +12,7 @@
 data/
 *.db
 *.log
+master.key
 
 # Environment
 .env

@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package nexus.keygen;
+
+option go_package = "nexus/proto/keygen";
+
+import "common.proto";
+import "token.proto";
+
+// KeyGenService - Generates data encryption keys (DEK)
+// Uses public key (PK_Encrypt) to encrypt DEK
+// Cannot decrypt - only has public key
+
+service KeyGenService {
+  // Generate a new data encryption key
+  // Returns encrypted DEK (for storage) and ECDH-encrypted DEK (for EncryptService)
+  rpc GenerateDataKey(GenerateDataKeyRequest) returns (GenerateDataKeyResponse);
+  
+  // Get service ECDH public key for key exchange
+  rpc GetPublicKey(GetPublicKeyRequest) returns (GetPublicKeyResponse);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message GenerateDataKeyRequest {
+  nexus.common.DelegationToken token = 1;  // Must be WRITE token
+  nexus.common.ECDHPublicKey client_ecdh_pub = 2;  // Client's ECDH public key for session
+}
+
+message GenerateDataKeyResponse {
+  // DEK encrypted with service's long-term public key (for KeyStore)
+  nexus.common.EncryptedDEK encrypted_dek = 1;
+  
+  // DEK encrypted with ECDH-derived session key (for EncryptService)
+  nexus.common.ECDHEncryptedDEK ecdh_encrypted_dek = 2;
+  
+  // Service's ephemeral ECDH public key (for client to derive shared secret)
+  nexus.common.ECDHPublicKey service_ecdh_pub = 3;
+  
+  // Key metadata
+  string key_id = 4;
+  string algorithm = 5;  // e.g., "AES-256-GCM"
+  
+  nexus.common.Error error = 6;
+}
+
+message GetPublicKeyRequest {}
+
+message GetPublicKeyResponse {
+  // Service's long-term public key for encrypting DEK (RSA/ECIES)
+  bytes public_key = 1;
+  string key_id = 2;
+  string algorithm = 3;
+  
+  nexus.common.Error error = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string service_name = 2;
+  string version = 3;
+  int64 uptime_seconds = 4;
+}

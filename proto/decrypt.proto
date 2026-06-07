@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package nexus.decrypt;
+
+option go_package = "nexus/proto/decrypt";
+
+import "common.proto";
+
+// DecryptService - Decrypts data using DEK
+// No persistent keys - uses DEK passed in request
+// Single responsibility: data decryption only
+
+service DecryptService {
+  // Decrypt data stream
+  // Uses ECDH-derived session key to decrypt DEK, then decrypts data
+  rpc Decrypt(DecryptRequest) returns (stream DecryptResponse);
+  
+  // Decrypt a single chunk (for non-streaming use)
+  rpc DecryptChunk(DecryptChunkRequest) returns (DecryptChunkResponse);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message DecryptRequest {
+  // DEK encrypted with ECDH-derived session key
+  nexus.common.ECDHEncryptedDEK ecdh_encrypted_dek = 1;
+  
+  // Client's ECDH private key
+  bytes client_ecdh_private_key = 2;
+  
+  // Service's ephemeral ECDH public key from KeyUnwrapService
+  nexus.common.ECDHPublicKey service_ecdh_pub = 3;
+  
+  // Encryption algorithm
+  string algorithm = 4;
+  
+  // Associated data for AEAD (optional)
+  bytes associated_data = 5;
+}
+
+message DecryptResponse {
+  // Decrypted data chunk
+  bytes plaintext_chunk = 1;
+  
+  // Chunk sequence number
+  int64 sequence = 2;
+  
+  // Indicates this is the last chunk
+  bool is_last = 3;
+  
+  nexus.common.Error error = 4;
+}
+
+message DecryptChunkRequest {
+  nexus.common.ECDHEncryptedDEK ecdh_encrypted_dek = 1;
+  bytes client_ecdh_private_key = 2;
+  nexus.common.ECDHPublicKey service_ecdh_pub = 3;
+  bytes ciphertext = 4;
+  bytes nonce = 5;
+  bytes auth_tag = 6;
+  string algorithm = 7;
+  bytes associated_data = 8;
+}
+
+message DecryptChunkResponse {
+  bytes plaintext = 1;
+  nexus.common.Error error = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string service_name = 2;
+  string version = 3;
+  int64 uptime_seconds = 4;
+}

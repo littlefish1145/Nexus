@@ -24,6 +24,26 @@ encryption:
   enable_dedup: true
   master_key_path: "./data/master.key"
 
+crypto_services:
+  enabled: true
+  distributed_mode: false
+  key_path: "./data/keys"
+  keystore_path: "./data/keystore"
+  opa_address: ""
+  consul_address: ""
+  audit_size: 10000
+  # gRPC service addresses (only used when distributed_mode=true)
+  token_service_addr: "localhost:50051"
+  keygen_service_addr: "localhost:50052"
+  keyunwrap_service_addr: "localhost:50053"
+  encrypt_service_addr: "localhost:50054"
+  decrypt_service_addr: "localhost:50055"
+  keystore_service_addr: "localhost:50056"
+  # mTLS (only used when distributed_mode=true)
+  mtls_cert_file: ""
+  mtls_key_file: ""
+  mtls_ca_file: ""
+
 vector:
   enabled: false
   hot_index_size: "10GB"
@@ -69,6 +89,12 @@ auth:
   jwt_secret: ""
   token_expiry: "24h"
   refresh_expiry: "168h"
+
+iam:
+  enabled: true
+  db_path: "./data/iam.db"
+  master_key_path: "./data/master.key"
+  sts_service_addr: "localhost:50057"
 
 tls:
   enabled: false

@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 	"nexus/internal/config"
 	"nexus/internal/gateway"
+	"nexus/internal/iam"
 	"nexus/internal/logger"
 )
 
@@ -141,9 +142,50 @@ func runServer() {
 		logger.Fatal("Failed to create gateway", zap.Error(err))
 	}
 
+	mux := http.NewServeMux()
+
+	// Initialize IAM system if enabled
+	if cfg.IAM.Enabled {
+		masterKey, err := iam.NewMasterKey(cfg.IAM.MasterKeyPath)
+		if err != nil {
+			logger.Fatal("Failed to initialize IAM master key", zap.Error(err))
+		}
+
+		iamStore, err := iam.NewIAMStore(cfg.IAM.DBPath)
+		if err != nil {
+			logger.Fatal("Failed to initialize IAM store", zap.Error(err))
+		}
+
+		iamService := iam.NewIAMService(iamStore, masterKey)
+
+		// Initialize admin user (first run only)
+		adminKey, err := iamService.InitializeAdmin()
+		if err != nil {
+			logger.Error("Failed to initialize admin user", zap.Error(err))
+		}
+		if adminKey != nil {
+			fmt.Println("==============================================")
+			fmt.Println("  NEXUS ADMIN ACCESS KEY (SHOW ONCE)")
+			fmt.Printf("  Access Key ID:     %s\n", adminKey.AccessKeyID)
+			fmt.Printf("  Secret Access Key: %s\n", adminKey.SecretAccessKey)
+			fmt.Println("  WARNING: This will NOT be shown again!")
+			fmt.Println("  Store these credentials securely.")
+			fmt.Println("==============================================")
+		}
+
+		// Create IAM bridge
+		iamBridge := gateway.NewIAMAuthBridge(iamService, gw.GetAuth())
+		gw.GetAuth().SetIAMBridge(iamBridge)
+		gw.SetIAMBridge(iamBridge)
+
+		// Mount IAM Admin API
+		iamAdminAPI := iam.NewAdminAPI(iamService, []byte("nexus-iam-jwt-key"))
+
+		mux.Handle("/iam/", http.StripPrefix("/iam", iamAdminAPI))
+	}
+
 	adminAPI := gateway.NewAdminAPI(gw, gw.GetAuth())
 
-	mux := http.NewServeMux()
 	mux.Handle("/", gw.Handler())
 	mux.Handle("/admin/", adminAPI.Handler())
 	mux.HandleFunc("/health", healthHandler(gw))
@@ -224,7 +266,6 @@ func runServer() {
 
 func healthHandler(gw *gateway.S3Gateway) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_ = r.Context()
 		health := map[string]interface{}{
 			"status":    "healthy",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
@@ -265,7 +306,6 @@ func healthHandler(gw *gateway.S3Gateway) http.HandlerFunc {
 
 func readyHandler(gw *gateway.S3Gateway) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_ = r.Context()
 		ready := true
 		reasons := []string{}
 		checks := make(map[string]string)

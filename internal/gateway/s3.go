@@ -19,13 +19,14 @@ import (
 	"sync"
 	"time"
 
+	"nexus/internal/bootstrap"
 	"nexus/internal/cache"
 	"nexus/internal/common"
 	"nexus/internal/config"
-	"nexus/internal/crypto"
 	"nexus/internal/metadata"
 	"nexus/internal/pipeline"
 	"nexus/internal/ratelimit"
+	"nexus/internal/services"
 	"nexus/internal/storage"
 	"nexus/internal/tiering"
 	"nexus/internal/vector"
@@ -43,21 +44,22 @@ var (
 )
 
 type S3Gateway struct {
-	mu          sync.RWMutex
-	config      *config.Config
-	metadata    *metadata.BoltDBMetadataStore
-	store       *storage.TieredObjectStore
-	tiering     *tiering.TieringManager
-	crypto      *crypto.EncryptionService
-	vector      *vector.VectorManager
-	pipeline    *pipeline.PipelineExecutor
-	auth        *AuthHandler
-	rateLimiter *ratelimit.MultiLevelLimiter
-	objectCache *cache.ObjectCache
-	metaCache   *cache.MetadataCache
-	server      *http.Server
-	buckets     map[string]*BucketState
-	accessLog   *AccessLogger
+	mu              sync.RWMutex
+	config          *config.Config
+	metadata        *metadata.BoltDBMetadataStore
+	store           *storage.TieredObjectStore
+	tiering         *tiering.TieringManager
+	cryptoCoordinator *services.EncryptionCoordinator
+	vector          *vector.VectorManager
+	pipeline        *pipeline.PipelineExecutor
+	auth            *AuthHandler
+	iamBridge       *IAMAuthBridge
+	rateLimiter     *ratelimit.MultiLevelLimiter
+	objectCache     *cache.ObjectCache
+	metaCache       *cache.MetadataCache
+	server          *http.Server
+	buckets         map[string]*BucketState
+	accessLog       *AccessLogger
 }
 
 type BucketState struct {
@@ -208,27 +210,14 @@ func (g *S3Gateway) initializeStores(cfg *config.Config) error {
 }
 
 func (g *S3Gateway) initializeComponents(cfg *config.Config) error {
-	var kms crypto.KMS
-	if cfg.Encryption.KMSType == "vault" {
-		vaultToken := ""
-		vaultKMS, err := crypto.NewVaultKMS(cfg.Encryption.VaultAddr, vaultToken, cfg.Encryption.VaultTransitKey)
+	// Initialize crypto services with zero-trust architecture
+	if cfg.CryptoServices.Enabled {
+		coordinator, err := bootstrap.InitializeCryptoServices(cfg)
 		if err != nil {
-			return fmt.Errorf("failed to create vault KMS: %w", err)
+			return fmt.Errorf("failed to initialize crypto services: %w", err)
 		}
-		kms = vaultKMS
-	} else {
-		localKMS, err := crypto.NewLocalKMS(cfg.Encryption.MasterKeyPath)
-		if err != nil {
-			return fmt.Errorf("failed to create local KMS: %w", err)
-		}
-		kms = localKMS
+		g.cryptoCoordinator = coordinator
 	}
-
-	encryptionService, err := crypto.NewEncryptionService(kms, cfg.Encryption.EnableDedup)
-	if err != nil {
-		return fmt.Errorf("failed to create encryption service: %w", err)
-	}
-	g.crypto = encryptionService
 
 	tieringConfig := &tiering.TieringConfig{
 		Enabled:          cfg.Tiering.Enabled,
@@ -472,7 +461,7 @@ func (g *S3Gateway) setCORSHeaders(w http.ResponseWriter, r *http.Request, bucke
 		}
 	}
 	if w.Header().Get("Access-Control-Allow-Origin") == "" {
-		w.Header().Set("Access-Control-Allow-Origin", "")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Length, x-amz-content-sha256, x-amz-date, x-amz-security-token, x-amz-user-agent, x-amz-meta-*, x-amz-acl, x-amz-copy-source, x-amz-tagging, x-amz-server-side-encryption, x-amz-checksum-crc32c, x-amz-checksum-sha256, x-amz-checksum-md5, x-amz-checksum-mode, X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, X-Amz-Signature, amz-sdk-invocation-id, amz-sdk-request, amz-sdk-retry")
@@ -1017,19 +1006,19 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 	var plaintextReader io.Reader = io.TeeReader(r.Body, multiWriter)
 
 	var dataReader io.Reader = plaintextReader
-	var encryptedDEK *crypto.EncryptedDEK
+	var encryptedDEKMetadata []byte
 	var encrypted bool
 	var actualStorageSize int64 = contentLength
 
-	if g.crypto != nil && g.config != nil && g.config.Encryption.EnableDedup {
-		encryptedReader, dek, err := g.crypto.StreamEncrypt(r.Context(), userID, bucket, key, plaintextReader, contentLength)
+	if g.cryptoCoordinator != nil && g.config != nil && g.config.CryptoServices.Enabled {
+		encryptedReader, _, metadata, ciphertextSize, err := g.cryptoCoordinator.EncryptOperation(r.Context(), userID, bucket, key, plaintextReader, contentLength)
 		if err != nil {
 			return fmt.Errorf("encryption failed: %w", err)
 		}
 		dataReader = encryptedReader
-		encryptedDEK = dek
+		encryptedDEKMetadata = metadata
 		encrypted = true
-		actualStorageSize = 0
+		actualStorageSize = ciphertextSize
 	}
 
 	objMetadata := &common.ObjectMetadata{
@@ -1111,8 +1100,8 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		ChecksumType:   storedChecksumType,
 	}
 
-	if encryptedDEK != nil {
-		meta.EncryptedDEK = encryptedDEK.EncryptedKey
+	if encryptedDEKMetadata != nil {
+		meta.EncryptedDEK = encryptedDEKMetadata
 	}
 
 	if err := g.metadata.PutObject(r.Context(), bucket, key, meta); err != nil {
@@ -1252,21 +1241,8 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 	var dataReader io.Reader = reader
 	var contentLength = objMetadata.Size
 
-	if objMetadata.Encrypted && g.crypto != nil && len(objMetadata.EncryptedDEK) > 0 {
-		encryptedDEKBytes := objMetadata.EncryptedDEK
-		if decoded, err := base64.StdEncoding.DecodeString(string(encryptedDEKBytes)); err == nil && len(decoded) > 0 {
-			encryptedDEKBytes = decoded
-		}
-
-		token, err := g.crypto.GetKMS().RequestReadToken(r.Context(), userID, bucket, key, "")
-		if err != nil {
-			return fmt.Errorf("failed to get read token: %w", err)
-		}
-
-		encryptedDEK := &crypto.EncryptedDEK{
-			EncryptedKey: encryptedDEKBytes,
-			Algorithm:    "AES-256-GCM",
-		}
+	if objMetadata.Encrypted && g.cryptoCoordinator != nil && len(objMetadata.EncryptedDEK) > 0 {
+		encryptedDEKMetadata := objMetadata.EncryptedDEK
 
 		rawFallback := r.Header.Get("x-amz-raw-decryption-fallback") == "true"
 		var rawBackup []byte
@@ -1280,7 +1256,7 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 			reader = io.NopCloser(bytes.NewReader(rawBackup))
 		}
 
-		decryptedReader, err := g.crypto.Decrypt(r.Context(), token, encryptedDEK, reader)
+		decryptedReader, err := g.cryptoCoordinator.DecryptOperation(r.Context(), userID, bucket, key, reader, "", encryptedDEKMetadata)
 		if err != nil {
 			fmt.Printf("[nexus] decryption error for %s/%s: %v\n", bucket, key, err)
 			if rawFallback && rawBackup != nil {
@@ -1743,6 +1719,14 @@ func (g *S3Gateway) GetPipelineExecutor() *pipeline.PipelineExecutor {
 
 func (g *S3Gateway) GetAuth() *AuthHandler {
 	return g.auth
+}
+
+func (g *S3Gateway) SetIAMBridge(bridge *IAMAuthBridge) {
+	g.iamBridge = bridge
+}
+
+func (g *S3Gateway) GetIAMBridge() *IAMAuthBridge {
+	return g.iamBridge
 }
 
 func (g *S3Gateway) auditLog(r *http.Request, action, bucket, key, userID, result string, details map[string]interface{}) {
