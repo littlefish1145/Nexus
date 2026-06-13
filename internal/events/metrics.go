@@ -4,10 +4,11 @@ import "sync/atomic"
 
 // Metrics holds Prometheus-style counters for event delivery.
 type Metrics struct {
-	DeadLetterTotal         atomic.Int64 // nexus_deadletter_total
+	DeadLetterTotal          atomic.Int64 // nexus_deadletter_total
 	EventDeliveryFailedTotal atomic.Int64 // nexus_event_delivery_failed_total
 	EventDeliverySuccessTotal atomic.Int64 // nexus_event_delivery_total{status="success"}
 	EventDeliveryRetryTotal  atomic.Int64 // nexus_event_delivery_total{status="retry"}
+	EventDroppedTotal        atomic.Int64 // nexus_event_dropped_total (events dropped due to full queues)
 }
 
 // NewMetrics creates a new Metrics instance.
@@ -35,6 +36,11 @@ func (m *Metrics) IncDeliveryRetry() {
 	m.EventDeliveryRetryTotal.Add(1)
 }
 
+// IncDropped increments the dropped event counter.
+func (m *Metrics) IncDropped() {
+	m.EventDroppedTotal.Add(1)
+}
+
 // GetDeadLetterTotal returns the dead letter counter value.
 func (m *Metrics) GetDeadLetterTotal() int64 {
 	return m.DeadLetterTotal.Load()
@@ -53,4 +59,9 @@ func (m *Metrics) GetDeliverySuccessTotal() int64 {
 // GetDeliveryRetryTotal returns the retry delivery counter value.
 func (m *Metrics) GetDeliveryRetryTotal() int64 {
 	return m.EventDeliveryRetryTotal.Load()
+}
+
+// GetDroppedTotal returns the dropped event counter value.
+func (m *Metrics) GetDroppedTotal() int64 {
+	return m.EventDroppedTotal.Load()
 }

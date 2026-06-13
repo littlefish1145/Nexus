@@ -12,8 +12,10 @@ import (
 )
 
 var (
-	address string
-	verbose bool
+	address          string
+	verbose          bool
+	sessionAccessKey string // in-memory only, never exported to env
+	sessionSecretKey string // in-memory only, never exported to env
 )
 
 var rootCmd = &cobra.Command{
@@ -38,12 +40,13 @@ Nexus S3-compatible storage system.`,
 			outputFmt = cfg.Output
 		}
 
-		// Set credentials from config if available
+		// Store credentials in memory for this session only (do NOT set as env vars
+		// to avoid leaking credentials to child processes and /proc/pid/environ)
 		if cfg.AccessKey != "" {
-			os.Setenv("NEXUS_ACCESS_KEY", cfg.AccessKey)
+			sessionAccessKey = cfg.AccessKey
 		}
 		if cfg.SecretKey != "" {
-			os.Setenv("NEXUS_SECRET_KEY", cfg.SecretKey)
+			sessionSecretKey = cfg.SecretKey
 		}
 	},
 }
@@ -72,8 +75,23 @@ func serverRequest(method, path string) (*http.Response, error) {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// Use session credentials (from config file) first, fall back to env vars
+	ak := sessionAccessKey
+	sk := sessionSecretKey
+	if ak == "" {
+		ak = os.Getenv("NEXUS_ACCESS_KEY")
+	}
+	if sk == "" {
+		sk = os.Getenv("NEXUS_SECRET_KEY")
+	}
+
 	user := os.Getenv("NEXUS_ADMIN_USER")
 	pass := os.Getenv("NEXUS_ADMIN_PASSWORD")
+	if user == "" && ak != "" {
+		user = ak
+		pass = sk
+	}
+
 	if user != "" && pass != "" {
 		req.SetBasicAuth(user, pass)
 	}
@@ -256,6 +274,50 @@ var vectorStatsCmd = &cobra.Command{
 	},
 }
 
+var vectorVerifyCmd = &cobra.Command{
+	Use:   "verify",
+	Short: "Verify vector index integrity",
+	Run: func(cmd *cobra.Command, args []string) {
+		bucket, _ := cmd.Flags().GetString("bucket")
+
+		path := "/admin/vector/verify"
+		if bucket != "" {
+			path = path + "?bucket=" + bucket
+		}
+
+		resp, err := serverRequest("POST", path)
+		if err != nil {
+			formatError(err, 503)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			formatError(fmt.Errorf("reading response: %w", err), 500)
+			os.Exit(1)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			formatError(fmt.Errorf("%s (status %d)", string(body), resp.StatusCode), resp.StatusCode)
+			os.Exit(1)
+		}
+
+		var data interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			fmt.Println(string(body))
+			return
+		}
+
+		out, err := formatOutput(data, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
+		}
+		fmt.Println(out)
+	},
+}
+
 var cryptoCmd = &cobra.Command{
 	Use:   "crypto",
 	Short: "Cryptographic operations",
@@ -266,10 +328,25 @@ var cryptoRotateCmd = &cobra.Command{
 	Short: "Rotate encryption keys",
 	Run: func(cmd *cobra.Command, args []string) {
 		bucket, _ := cmd.Flags().GetString("bucket")
+		keyID, _ := cmd.Flags().GetString("key-id")
+		rewrap, _ := cmd.Flags().GetBool("rewrap")
 
 		path := "/admin/crypto/rotate"
+		params := []string{}
 		if bucket != "" {
-			path = path + "?bucket=" + bucket
+			params = append(params, "bucket="+bucket)
+		}
+		if keyID != "" {
+			params = append(params, "key_id="+keyID)
+		}
+		if rewrap {
+			params = append(params, "rewrap=true")
+		}
+		if len(params) > 0 {
+			path = path + "?" + params[0]
+			for _, p := range params[1:] {
+				path = path + "&" + p
+			}
 		}
 
 		resp, err := serverRequest("POST", path)
@@ -285,7 +362,11 @@ var cryptoRotateCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		result := map[string]string{"message": "Key rotation triggered successfully"}
+		msg := "Key rotation triggered successfully"
+		if rewrap {
+			msg = "Key rotation and DEK rewrap triggered successfully"
+		}
+		result := map[string]string{"message": msg}
 		out, err := formatOutput(result, outputFmt, queryStr)
 		if err != nil {
 			formatError(err, 500)
@@ -390,10 +471,14 @@ func init() {
 	vectorCmd.AddCommand(vectorRebuildCmd)
 	vectorRebuildCmd.Flags().String("bucket", "", "Specific bucket to rebuild index for")
 	vectorCmd.AddCommand(vectorStatsCmd)
+	vectorCmd.AddCommand(vectorVerifyCmd)
+	vectorVerifyCmd.Flags().String("bucket", "", "Specific bucket to verify index for")
 
 	rootCmd.AddCommand(cryptoCmd)
 	cryptoCmd.AddCommand(cryptoRotateCmd)
 	cryptoRotateCmd.Flags().String("bucket", "", "Specific bucket to rotate keys for")
+	cryptoRotateCmd.Flags().String("key-id", "", "Specific key ID to rotate")
+	cryptoRotateCmd.Flags().Bool("rewrap", false, "Trigger background rewrap of existing DEKs after rotation")
 	cryptoCmd.AddCommand(cryptoStatusCmd)
 
 	rootCmd.AddCommand(profileCmd)

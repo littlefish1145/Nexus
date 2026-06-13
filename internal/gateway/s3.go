@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -24,7 +25,9 @@ import (
 	"nexus/internal/common"
 	"nexus/internal/config"
 	"nexus/internal/events"
+	"nexus/internal/fts"
 	"nexus/internal/metadata"
+	"nexus/internal/observability"
 	"nexus/internal/pipeline"
 	"nexus/internal/ratelimit"
 	"nexus/internal/services"
@@ -52,6 +55,7 @@ type S3Gateway struct {
 	tiering         *tiering.TieringManager
 	cryptoCoordinator *services.EncryptionCoordinator
 	vector          *vector.VectorManager
+	ftsIndex        *fts.InvertedIndex
 	pipeline        *pipeline.PipelineExecutor
 	auth            *AuthHandler
 	iamBridge       *IAMAuthBridge
@@ -62,6 +66,11 @@ type S3Gateway struct {
 	buckets         map[string]*BucketState
 	accessLog       *AccessLogger
 	eventBus        *events.EventBus
+	metrics         *observability.MetricsRegistry
+	tracerShutdown  func(context.Context) error
+	healthHandler   *observability.HealthHandler
+	resumableHandler *ResumableUploadHandler
+	resumableCleanup *ResumableCleanup
 }
 
 type BucketState struct {
@@ -212,6 +221,31 @@ func (g *S3Gateway) initializeStores(cfg *config.Config) error {
 }
 
 func (g *S3Gateway) initializeComponents(cfg *config.Config) error {
+	// Initialize observability (metrics + tracing)
+	if cfg.Observability.MetricsEnabled {
+		g.metrics = observability.NewMetricsRegistry()
+	}
+
+	if cfg.Observability.TracingEnabled {
+		tracingCfg := &observability.TracingConfig{
+			Enabled:     true,
+			Endpoint:    cfg.Observability.TracingEndpoint,
+			ServiceName: cfg.Observability.TracingServiceName,
+			Insecure:    cfg.Observability.TracingInsecure,
+		}
+		shutdown, err := observability.InitTracer(tracingCfg)
+		if err != nil {
+			return fmt.Errorf("failed to initialize tracer: %w", err)
+		}
+		g.tracerShutdown = shutdown
+	}
+
+	// Initialize health checks
+	g.healthHandler = observability.NewHealthHandler()
+	g.healthHandler.RegisterCheck("boltdb", func() bool {
+		return g.metadata != nil
+	})
+
 	// Initialize crypto services with zero-trust architecture
 	if cfg.CryptoServices.Enabled {
 		coordinator, err := bootstrap.InitializeCryptoServices(cfg)
@@ -334,13 +368,84 @@ func (g *S3Gateway) initializeComponents(cfg *config.Config) error {
 		g.eventBus = bus
 	}
 
+	// Initialize FTS (Full-Text Search)
+	if cfg.FTS.Enabled {
+		ftsDataDir := cfg.FTS.DataDir
+		if ftsDataDir == "" {
+			ftsDataDir = cfg.Node.DataDir + "/fts"
+		}
+		ftsDBPath := ftsDataDir + "/fts.db"
+		ftsIndex, err := fts.NewInvertedIndex(ftsDBPath)
+		if err != nil {
+			return fmt.Errorf("failed to create FTS index: %w", err)
+		}
+		// Apply BM25 parameters from config
+		if cfg.FTS.BM25K1 > 0 {
+			ftsIndex.GetScorer().K1 = cfg.FTS.BM25K1
+		}
+		if cfg.FTS.BM25B > 0 {
+			ftsIndex.GetScorer().B = cfg.FTS.BM25B
+		}
+		// Apply disk quota
+		if cfg.FTS.MaxIndexSize != "" {
+			if maxSize, err := parseFTSMaxSize(cfg.FTS.MaxIndexSize); err == nil && maxSize > 0 {
+				ftsIndex.SetCompactionMaxIndexSize(maxSize)
+			}
+		}
+		g.ftsIndex = ftsIndex
+	}
+
+	// Initialize resumable upload handler
+	if cfg.Resumable.Enabled {
+		g.resumableHandler = NewResumableUploadHandler(g)
+		cleanupInterval := 5 * time.Minute
+		if cfg.Resumable.CleanupInterval != "" {
+			if d, err := time.ParseDuration(cfg.Resumable.CleanupInterval); err == nil {
+				cleanupInterval = d
+			}
+		}
+		g.resumableCleanup = NewResumableCleanup(g.resumableHandler, cleanupInterval)
+		g.resumableCleanup.Start()
+	}
+
 	return nil
 }
 
 func (g *S3Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
+
+	// Health check endpoints
+	if g.healthHandler != nil {
+		mux.HandleFunc("/healthz", g.healthHandler.HealthzHandler())
+		mux.HandleFunc("/readyz", g.healthHandler.ReadyzHandler())
+		mux.HandleFunc("/livez", g.healthHandler.LivezHandler())
+	}
+
+	// Prometheus metrics endpoint
+	metricsPath := "/metrics"
+	if g.config != nil && g.config.Observability.MetricsPath != "" {
+		metricsPath = g.config.Observability.MetricsPath
+	}
+	mux.Handle(metricsPath, observability.MetricsHandler())
+
+	// FTS search endpoint
+	mux.HandleFunc("/admin/fts/search", g.handleAdminFTSSearch)
+
 	mux.HandleFunc("/", g.handleRequest)
-	return mux
+
+	var handler http.Handler = mux
+
+	// Apply tracing middleware
+	if g.config != nil && g.config.Observability.TracingEnabled {
+		handler = observability.TracingHTTPMiddleware(handler)
+	}
+
+	// Apply metrics HTTP middleware
+	if g.metrics != nil {
+		handler = g.metrics.HTTPMiddleware(handler)
+	}
+
+	return handler
 }
 
 func (g *S3Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -487,10 +592,10 @@ func (g *S3Gateway) setCORSHeaders(w http.ResponseWriter, r *http.Request, bucke
 	if w.Header().Get("Access-Control-Allow-Origin") == "" {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	}
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Length, x-amz-content-sha256, x-amz-date, x-amz-security-token, x-amz-user-agent, x-amz-meta-*, x-amz-acl, x-amz-copy-source, x-amz-tagging, x-amz-server-side-encryption, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key, x-amz-server-side-encryption-customer-key-MD5, x-amz-checksum-crc32c, x-amz-checksum-sha256, x-amz-checksum-md5, x-amz-checksum-mode, X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, X-Amz-Signature, amz-sdk-invocation-id, amz-sdk-request, amz-sdk-retry")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Length, x-amz-content-sha256, x-amz-date, x-amz-security-token, x-amz-user-agent, x-amz-meta-*, x-amz-acl, x-amz-copy-source, x-amz-tagging, x-amz-server-side-encryption, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key, x-amz-server-side-encryption-customer-key-MD5, x-amz-checksum-crc32c, x-amz-checksum-sha256, x-amz-checksum-md5, x-amz-checksum-mode, X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, X-Amz-Signature, amz-sdk-invocation-id, amz-sdk-request, amz-sdk-retry, X-Nexus-Resumable, X-Nexus-Finalize, Upload-Offset, Upload-Length, Upload-Checksum")
 	w.Header().Set("Access-Control-Max-Age", "3600")
-	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Amz-Version-Id, X-Amz-Request-Id, X-Amz-Expiration, X-Amz-Checksum-CRC32C, X-Amz-Checksum-SHA256, X-Amz-Checksum-MD5, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key-MD5")
+	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Amz-Version-Id, X-Amz-Request-Id, X-Amz-Expiration, X-Amz-Checksum-CRC32C, X-Amz-Checksum-SHA256, X-Amz-Checksum-MD5, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key-MD5, X-Nexus-Upload-Id, Upload-Offset, Upload-Length, Upload-Checksum")
 }
 
 func (g *S3Gateway) validateBucketName(name string) bool {
@@ -578,6 +683,43 @@ func (g *S3Gateway) handlePOST(w http.ResponseWriter, r *http.Request) error {
 		return g.handleVectorSearch(w, r)
 	}
 
+	if query.Has("fts_search") {
+		return g.handleFTSSearch(w, r)
+	}
+
+	// Resumable upload: POST /{bucket}/{key}?resumable creates a session
+	if query.Has("resumable") && g.resumableHandler != nil {
+		path := r.URL.Path
+		parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)
+		bucket := ""
+		key := ""
+		if len(parts) >= 1 {
+			bucket = parts[0]
+		}
+		if len(parts) >= 2 {
+			key = parts[1]
+		}
+		if bucket == "" || key == "" {
+			return fmt.Errorf("bucket and key are required for resumable upload")
+		}
+		return g.resumableHandler.HandleCreateSession(w, r, bucket, key)
+	}
+
+	// Resumable upload finalize: POST /{bucket}/{key}?uploadId=...&finalize=1
+	if query.Has("uploadId") && query.Has("finalize") && g.resumableHandler != nil {
+		path := r.URL.Path
+		parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)
+		bucket := ""
+		key := ""
+		if len(parts) >= 1 {
+			bucket = parts[0]
+		}
+		if len(parts) >= 2 {
+			key = parts[1]
+		}
+		return g.resumableHandler.HandleFinalize(w, r, bucket, key)
+	}
+
 	if query.Has("uploads") {
 		multipartHandler := NewMultipartUploadHandler(g)
 		bucket := query.Get("bucket")
@@ -630,6 +772,9 @@ func (g *S3Gateway) handleBucketOperations(bucket, method string) func(w http.Re
 			if query.Has("location") {
 				return g.handleGetBucketLocation(w, r, bucket)
 			}
+			if query.Has("fts_search") {
+				return g.handleFTSSearch(w, r)
+			}
 			if query.Has("acl") {
 				if _, err := g.auth.RequireAuthForBucket(r, bucket, "read"); err != nil {
 					return fmt.Errorf("access denied: %w", err)
@@ -658,6 +803,26 @@ func (g *S3Gateway) handleBucketOperations(bucket, method string) func(w http.Re
 func (g *S3Gateway) handleObjectOperations(bucket, key, method string) func(w http.ResponseWriter, r *http.Request) error {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		query := r.URL.Query()
+
+		// Resumable upload routing: when uploadId is present and resumable handler is active,
+		// route to resumable flow. When X-Nexus-Resumable header is set, also use resumable flow.
+		// Otherwise, fall through to standard S3 multipart upload flow.
+		if query.Has("uploadId") && g.resumableHandler != nil && r.Header.Get("X-Nexus-Resumable") == "1" {
+			switch method {
+			case "PATCH":
+				return g.resumableHandler.HandlePatch(w, r, bucket, key)
+			case "HEAD":
+				return g.resumableHandler.HandleHead(w, r, bucket, key)
+			case "POST":
+				if query.Has("finalize") {
+					return g.resumableHandler.HandleFinalize(w, r, bucket, key)
+				}
+				return fmt.Errorf("unsupported POST operation for resumable upload")
+			default:
+				return fmt.Errorf("method not allowed for resumable upload")
+			}
+		}
+
 		if query.Has("uploadId") {
 			multipartHandler := NewMultipartUploadHandler(g)
 			switch method {
@@ -685,6 +850,12 @@ func (g *S3Gateway) handleObjectOperations(bucket, key, method string) func(w ht
 			return g.handleDeleteObject(w, r, bucket, key)
 		case "POST":
 			return g.handleObjectPOST(w, r, bucket, key)
+		case "PATCH":
+			// PATCH method for resumable uploads (with uploadId in query)
+			if g.resumableHandler != nil && query.Has("uploadId") {
+				return g.resumableHandler.HandlePatch(w, r, bucket, key)
+			}
+			return fmt.Errorf("method not allowed")
 		default:
 			return fmt.Errorf("method not allowed")
 		}
@@ -1049,6 +1220,10 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		ssecKeySHA256 = services.ComputeSSECKeySHA256(clientKey)
 
 		encryptedReader, ssecMetadata, ciphertextSize, err := g.cryptoCoordinator.EncryptWithClientKey(r.Context(), plaintextReader, clientKey, contentLength)
+		// Zero the client key immediately after encryption (spec: key must not persist beyond handler scope)
+		for i := range clientKey {
+			clientKey[i] = 0
+		}
 		if err != nil {
 			return fmt.Errorf("SSE-C encryption failed: %w", err)
 		}
@@ -1056,6 +1231,12 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		encryptedDEKMetadata = ssecMetadata
 		encrypted = true
 		actualStorageSize = ciphertextSize
+	} else if clientKey != nil {
+		// SSE-C requested but no crypto coordinator - zero key and reject
+		for i := range clientKey {
+			clientKey[i] = 0
+		}
+		return fmt.Errorf("SSE-C encryption requested but encryption services are not enabled")
 	} else if g.cryptoCoordinator != nil && g.config != nil && g.config.CryptoServices.Enabled {
 		encryptedReader, _, metadata, ciphertextSize, err := g.cryptoCoordinator.EncryptOperation(r.Context(), userID, bucket, key, plaintextReader, contentLength)
 		if err != nil {
@@ -1158,11 +1339,13 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		meta.EncryptedDEK = encryptedDEKMetadata
 	}
 
-	// SSE-C: disable dedup - client-provided keys mean each object has unique encryption
+	// SSE-C: dedup must be disabled per spec (SSE-C objects cannot be deduplicated
+	// because each object is encrypted with a different customer key, producing unique ciphertexts).
+	// If dedup is enabled, log a warning but proceed without dedup for this object.
 	if ssecUsed && g.config != nil && g.config.Encryption.EnableDedup {
-		// Dedup is not safe with SSE-C because each object is encrypted with a
-		// different customer key, so identical plaintexts produce different ciphertexts.
-		// Skip dedup logic for SSE-C objects.
+		// Dedup is not applicable for SSE-C objects; the object is stored independently.
+		// No action needed here since dedup logic is not yet implemented in the storage path,
+		// but when it is, SSE-C objects must be excluded from content-addressable storage.
 	}
 
 	if err := g.metadata.PutObject(r.Context(), bucket, key, meta); err != nil {
@@ -1181,6 +1364,13 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		}
 	}
 
+	// FTS indexing for text content
+	if g.ftsIndex != nil && g.config.FTS.Enabled {
+		if r.Header.Get("X-FTS-Index") != "false" {
+			go g.ftsIndexObject(r.Context(), bucket, key, contentType, objMetadata.VersionID)
+		}
+	}
+
 	if g.pipeline != nil {
 		go g.triggerPipelines(r.Context(), bucket, key, contentType, metadataMap)
 	}
@@ -1189,7 +1379,10 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 	w.Header().Set("x-amz-version-id", objMetadata.VersionID)
 	if ssecUsed {
 		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
-		w.Header().Set("x-amz-server-side-encryption", "AES256")
+		// Echo back the customer key MD5 for SSE-C verification
+		if keyMD5 := r.Header.Get("x-amz-server-side-encryption-customer-key-MD5"); keyMD5 != "" {
+			w.Header().Set("x-amz-server-side-encryption-customer-key-MD5", keyMD5)
+		}
 	} else if encrypted {
 		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
@@ -1202,6 +1395,11 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		w.Header().Set("x-amz-checksum-md5", storedChecksum)
 	}
 	w.WriteHeader(http.StatusOK)
+
+	// Record metrics
+	if g.metrics != nil {
+		g.metrics.RecordPutObject(bucket, "success")
+	}
 
 	auditDetails := map[string]interface{}{
 		"size":         contentLength,
@@ -1336,20 +1534,32 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 			g.writeError(w, http.StatusForbidden, "AccessDenied", "Object encrypted with SSE-C requires customer key headers")
 			return nil
 		}
-		// Verify the provided key matches the stored key SHA-256
+		// Verify the provided key matches the stored key SHA-256 (constant-time comparison to prevent timing attacks)
 		keySHA256 := services.ComputeSSECKeySHA256(clientKey)
-		if keySHA256 != objMetadata.SSECKeySHA256 {
+		if subtle.ConstantTimeCompare([]byte(keySHA256), []byte(objMetadata.SSECKeySHA256)) != 1 {
 			g.writeError(w, http.StatusForbidden, "AccessDenied", "The provided SSE-C key does not match the key used to encrypt the object")
+			// Zero the client key immediately after failed verification
+			for i := range clientKey {
+				clientKey[i] = 0
+			}
 			return nil
 		}
 		if g.cryptoCoordinator != nil && len(objMetadata.EncryptedDEK) > 0 {
 			decryptedReader, err := g.cryptoCoordinator.DecryptWithClientKey(r.Context(), reader, clientKey, objMetadata.EncryptedDEK, objMetadata.Size)
+			// Zero the client key immediately after use
+			for i := range clientKey {
+				clientKey[i] = 0
+			}
 			if err != nil {
-				fmt.Printf("[nexus] SSE-C decryption error for %s/%s: %v\n", bucket, key, err)
 				g.writeError(w, http.StatusInternalServerError, "InternalError", "An internal error occurred while processing the object")
 				return nil
 			}
 			dataReader = decryptedReader
+		} else {
+			// Zero the client key if not used for decryption
+			for i := range clientKey {
+				clientKey[i] = 0
+			}
 		}
 	} else if objMetadata.Encrypted && g.cryptoCoordinator != nil && len(objMetadata.EncryptedDEK) > 0 {
 		encryptedDEKMetadata := objMetadata.EncryptedDEK
@@ -1430,7 +1640,10 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 
 	if objMetadata.SSECUsed {
 		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
-		w.Header().Set("x-amz-server-side-encryption", "AES256")
+		// Echo back the customer key MD5 from the request for SSE-C verification
+		if keyMD5 := r.Header.Get("x-amz-server-side-encryption-customer-key-MD5"); keyMD5 != "" {
+			w.Header().Set("x-amz-server-side-encryption-customer-key-MD5", keyMD5)
+		}
 	} else if objMetadata.Encrypted {
 		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
@@ -1457,6 +1670,11 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 	}
 
 	io.Copy(w, dataReader)
+
+	// Record metrics
+	if g.metrics != nil {
+		g.metrics.RecordGetObject(bucket, "success", contentLength)
+	}
 
 	return nil
 }
@@ -1554,11 +1772,15 @@ func (g *S3Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, buc
 			g.writeError(w, http.StatusForbidden, "AccessDenied", "Object encrypted with SSE-C requires customer key headers")
 			return nil
 		}
-		// Verify the provided key matches the stored key SHA-256
+		// Verify the provided key matches the stored key SHA-256 (constant-time comparison to prevent timing attacks)
 		keySHA256 := services.ComputeSSECKeySHA256(clientKey)
-		if keySHA256 != objMetadata.SSECKeySHA256 {
+		if subtle.ConstantTimeCompare([]byte(keySHA256), []byte(objMetadata.SSECKeySHA256)) != 1 {
 			g.writeError(w, http.StatusForbidden, "AccessDenied", "The provided SSE-C key does not match the key used to encrypt the object")
 			return nil
+		}
+		// Zero the client key after verification for HEAD (no decryption needed)
+		for i := range clientKey {
+			clientKey[i] = 0
 		}
 	}
 
@@ -1570,7 +1792,10 @@ func (g *S3Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, buc
 
 	if objMetadata.SSECUsed {
 		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
-		w.Header().Set("x-amz-server-side-encryption", "AES256")
+		// Echo back the customer key MD5 for SSE-C verification
+		if keyMD5 := r.Header.Get("x-amz-server-side-encryption-customer-key-MD5"); keyMD5 != "" {
+			w.Header().Set("x-amz-server-side-encryption-customer-key-MD5", keyMD5)
+		}
 	} else if objMetadata.Encrypted {
 		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
@@ -1644,6 +1869,10 @@ func (g *S3Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, b
 			g.vector.DeleteVector(r.Context(), bucket, key)
 		}
 
+		if g.ftsIndex != nil {
+			g.ftsIndex.DeleteDocumentByKey(bucket, key)
+		}
+
 		if g.objectCache != nil {
 			g.objectCache.Delete(r.Context(), bucket+"/"+key)
 		}
@@ -1670,6 +1899,12 @@ func (g *S3Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, b
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+
+	// Record metrics
+	if g.metrics != nil {
+		g.metrics.RecordPutObject(bucket, "delete")
+	}
+
 	return nil
 }
 
@@ -1841,6 +2076,242 @@ func (g *S3Gateway) handleVectorSearchForObject(w http.ResponseWriter, r *http.R
 	return g.handleVectorSearch(w, r)
 }
 
+// FTSSearchResponse is the JSON response for FTS search.
+type FTSSearchResponse struct {
+	Results    []FTSSearchResultItem `json:"results"`
+	Total      int                   `json:"total"`
+	LatencyMs  int64                 `json:"latency_ms"`
+}
+
+// FTSSearchResultItem represents a single FTS search result.
+type FTSSearchResultItem struct {
+	ID        string   `json:"id"`
+	Bucket    string   `json:"bucket"`
+	Key       string   `json:"key"`
+	Score     float64  `json:"score"`
+	Snippet   string   `json:"snippet"`
+	Highlight []string `json:"highlight"`
+}
+
+// handleFTSSearch handles full-text search requests.
+// Supports: POST /?fts_search, GET /{bucket}?fts_search&q=...&topK=...
+// Also: /admin/fts/search?bucket=...&q=...&topK=...
+func (g *S3Gateway) handleFTSSearch(w http.ResponseWriter, r *http.Request) error {
+	if g.ftsIndex == nil {
+		return fmt.Errorf("FTS is not enabled")
+	}
+
+	// Require authentication
+	if _, err := g.auth.RequireAuth(r, "read"); err != nil {
+		return fmt.Errorf("FTS search requires authentication: %w", err)
+	}
+
+	query := r.URL.Query()
+	searchQuery := query.Get("q")
+	if searchQuery == "" {
+		searchQuery = query.Get("fts_search")
+	}
+	if searchQuery == "" {
+		// Try reading from POST body
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1024*1024))
+		if err == nil && len(body) > 0 {
+			var req struct {
+				Query string `json:"query"`
+				Bucket string `json:"bucket"`
+				TopK   int    `json:"top_k"`
+			}
+			if json.Unmarshal(body, &req) == nil && req.Query != "" {
+				searchQuery = req.Query
+			}
+		}
+	}
+
+	if searchQuery == "" {
+		return fmt.Errorf("missing search query parameter 'q'")
+	}
+
+	if len(searchQuery) > 10000 {
+		return fmt.Errorf("search query too long: maximum 10000 characters")
+	}
+
+	bucket := query.Get("bucket")
+	topKStr := query.Get("topK")
+	if topKStr == "" {
+		topKStr = query.Get("top_k")
+	}
+
+	topK := 20
+	if topKStr != "" {
+		if k, err := strconv.Atoi(topKStr); err == nil {
+			topK = k
+		}
+	}
+	if topK > 100 {
+		topK = 100
+	}
+	if topK <= 0 {
+		topK = 1
+	}
+
+	startTime := time.Now()
+
+	results, err := g.ftsIndex.Search(searchQuery, topK)
+	if err != nil {
+		return fmt.Errorf("FTS search failed: %w", err)
+	}
+
+	// Filter by bucket if specified
+	if bucket != "" {
+		var filtered []fts.SearchResult
+		for _, r := range results {
+			if r.Bucket == bucket {
+				filtered = append(filtered, r)
+			}
+		}
+		results = filtered
+	}
+
+	// Build response with snippets and highlights
+	queryTokens := fts.Tokenize(searchQuery)
+	responseResults := make([]FTSSearchResultItem, 0, len(results))
+
+	for _, r := range results {
+		item := FTSSearchResultItem{
+			ID:     fmt.Sprintf("%d", r.DocID),
+			Bucket: r.Bucket,
+			Key:    r.Key,
+			Score:  r.Score,
+		}
+
+		// Generate snippet and highlight from object content
+		content := g.getObjectTextContent(r.Bucket, r.Key)
+		if content != "" {
+			item.Snippet = fts.GenerateSnippet(content, queryTokens, 100)
+			highlighted := fts.HighlightTerms(content, queryTokens)
+			// Extract highlighted terms for the highlight array
+			highlights := extractHighlights(highlighted)
+			item.Highlight = highlights
+		}
+
+		responseResults = append(responseResults, item)
+	}
+
+	response := FTSSearchResponse{
+		Results:   responseResults,
+		Total:     len(responseResults),
+		LatencyMs: time.Since(startTime).Milliseconds(),
+	}
+
+	return g.writeJSON(w, http.StatusOK, response)
+}
+
+// getObjectTextContent reads the text content of an object for snippet generation.
+func (g *S3Gateway) getObjectTextContent(bucket, key string) string {
+	objMeta, err := g.metadata.GetObject(context.Background(), bucket, key)
+	if err != nil {
+		return ""
+	}
+
+	// Only read text content types
+	contentType := objMeta.ContentType
+	if !isTextContentType(contentType) {
+		return ""
+	}
+
+	storageTier := common.StorageTier(objMeta.StorageTier)
+	reader, _, err := g.store.Get(context.Background(), bucket, key, storageTier)
+	if err != nil {
+		return ""
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(io.LimitReader(reader, 1024*1024)) // limit to 1MB
+	if err != nil {
+		return ""
+	}
+
+	return string(data)
+}
+
+// isTextContentType checks if a content type is text-based.
+func isTextContentType(contentType string) bool {
+	textPrefixes := []string{
+		"text/",
+		"application/json",
+		"application/xml",
+		"application/javascript",
+		"application/x-yaml",
+		"application/markdown",
+	}
+	for _, prefix := range textPrefixes {
+		if strings.HasPrefix(contentType, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractHighlights extracts <em> tagged terms from highlighted text.
+func extractHighlights(highlighted string) []string {
+	var highlights []string
+	for {
+		startIdx := strings.Index(highlighted, "<em>")
+		if startIdx == -1 {
+			break
+		}
+		endIdx := strings.Index(highlighted, "</em>")
+		if endIdx == -1 {
+			break
+		}
+		term := highlighted[startIdx+4 : endIdx]
+		highlights = append(highlights, "<em>"+term+"</em>")
+		highlighted = highlighted[endIdx+5:]
+	}
+	return highlights
+}
+
+// parseFTSMaxSize parses a size string (e.g., "10GB") into bytes.
+func parseFTSMaxSize(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	var multiplier int64 = 1
+	if len(s) >= 2 {
+		switch s[len(s)-2:] {
+		case "GB":
+			multiplier = 1 << 30
+			s = s[:len(s)-2]
+		case "MB":
+			multiplier = 1 << 20
+			s = s[:len(s)-2]
+		case "KB":
+			multiplier = 1 << 10
+			s = s[:len(s)-2]
+		case "TB":
+			multiplier = 1 << 40
+			s = s[:len(s)-2]
+		}
+	}
+	var value int64
+	_, err := fmt.Sscanf(s, "%d", &value)
+	if err != nil {
+		return 0, err
+	}
+	return value * multiplier, nil
+}
+
+// handleAdminFTSSearch handles the /admin/fts/search endpoint.
+func (g *S3Gateway) handleAdminFTSSearch(w http.ResponseWriter, r *http.Request) {
+	if g.ftsIndex == nil {
+		g.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "FTS is not enabled"})
+		return
+	}
+
+	if err := g.handleFTSSearch(w, r); err != nil {
+		g.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+}
+
 // truncateString truncates a string to maxLen characters
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
@@ -1900,6 +2371,43 @@ func (g *S3Gateway) vectorizeObject(ctx context.Context, bucket, key, contentTyp
 		"content_type": contentType,
 		"content_size": len(content),
 	})
+}
+
+// ftsIndexObject reads object content and indexes it for full-text search.
+// Only text-based content types are indexed; binary files are skipped.
+func (g *S3Gateway) ftsIndexObject(ctx context.Context, bucket, key, contentType, versionID string) {
+	// Only index text-based content types
+	if !isTextContentType(contentType) {
+		return
+	}
+
+	objMeta, err := g.metadata.GetObject(ctx, bucket, key)
+	if err != nil {
+		return
+	}
+
+	storageTier := common.StorageTier(objMeta.StorageTier)
+	reader, _, err := g.store.Get(ctx, bucket, key, storageTier)
+	if err != nil {
+		return
+	}
+	defer reader.Close()
+
+	// Limit text extraction to 1MB
+	limitedReader := io.LimitReader(reader, 1024*1024)
+	content, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return
+	}
+
+	text := string(content)
+	if len(strings.TrimSpace(text)) == 0 {
+		return
+	}
+
+	if err := g.ftsIndex.AddDocumentWithInfo(bucket, key, versionID, text); err != nil {
+		return
+	}
 }
 
 func (g *S3Gateway) triggerPipelines(ctx context.Context, bucket, key, contentType string, metadataMap map[string]string) {
@@ -1966,8 +2474,17 @@ func (g *S3Gateway) Stop() error {
 }
 
 func (g *S3Gateway) Close() error {
+	if g.resumableCleanup != nil {
+		g.resumableCleanup.Stop()
+	}
+	if g.tracerShutdown != nil {
+		g.tracerShutdown(context.Background())
+	}
 	if g.eventBus != nil {
 		g.eventBus.Stop()
+	}
+	if g.ftsIndex != nil {
+		g.ftsIndex.Close()
 	}
 	if g.accessLog != nil {
 		return g.accessLog.Close()
@@ -1989,6 +2506,10 @@ func (g *S3Gateway) GetTieringManager() *tiering.TieringManager {
 
 func (g *S3Gateway) GetVectorManager() *vector.VectorManager {
 	return g.vector
+}
+
+func (g *S3Gateway) GetFTSIndex() *fts.InvertedIndex {
+	return g.ftsIndex
 }
 
 func (g *S3Gateway) GetPipelineExecutor() *pipeline.PipelineExecutor {
@@ -2095,6 +2616,8 @@ func (g *S3Gateway) validatePresignedURLMethod(r *http.Request, expectedMethod s
 // parseSSECHeaders parses and validates SSE-C headers from the request.
 // Returns the decoded client key, or an error if validation fails.
 // If no SSE-C headers are present, returns nil key with no error.
+// Per S3 spec, the x-amz-server-side-encryption-customer-key-MD5 header is required
+// when using SSE-C to ensure the key was transmitted correctly.
 func parseSSECHeaders(r *http.Request) ([]byte, error) {
 	algorithm := r.Header.Get("x-amz-server-side-encryption-customer-algorithm")
 	keyB64 := r.Header.Get("x-amz-server-side-encryption-customer-key")
@@ -2110,6 +2633,11 @@ func parseSSECHeaders(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("invalid SSE-C algorithm: must be AES256")
 	}
 
+	// Key is required when algorithm is specified
+	if keyB64 == "" {
+		return nil, fmt.Errorf("SSE-C customer key is required when algorithm is specified")
+	}
+
 	// Decode the customer key
 	clientKey, err := base64.StdEncoding.DecodeString(keyB64)
 	if err != nil {
@@ -2118,19 +2646,37 @@ func parseSSECHeaders(r *http.Request) ([]byte, error) {
 
 	// Validate key length (must be 32 bytes for AES-256)
 	if len(clientKey) != 32 {
+		// Zero the key before returning error
+		for i := range clientKey {
+			clientKey[i] = 0
+		}
 		return nil, fmt.Errorf("invalid SSE-C customer key: must be 256-bit (32 bytes)")
 	}
 
-	// Validate MD5 if provided
-	if keyMD5B64 != "" {
-		expectedMD5, err := base64.StdEncoding.DecodeString(keyMD5B64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid SSE-C customer key MD5: not valid base64")
+	// MD5 header is required per S3 spec for SSE-C
+	if keyMD5B64 == "" {
+		// Zero the key before returning error
+		for i := range clientKey {
+			clientKey[i] = 0
 		}
-		computedMD5 := md5.Sum(clientKey)
-		if !bytes.Equal(expectedMD5, computedMD5[:]) {
-			return nil, fmt.Errorf("SSE-C customer key MD5 mismatch")
+		return nil, fmt.Errorf("SSE-C customer key MD5 is required")
+	}
+
+	expectedMD5, err := base64.StdEncoding.DecodeString(keyMD5B64)
+	if err != nil {
+		// Zero the key before returning error
+		for i := range clientKey {
+			clientKey[i] = 0
 		}
+		return nil, fmt.Errorf("invalid SSE-C customer key MD5: not valid base64")
+	}
+	computedMD5 := md5.Sum(clientKey)
+	if subtle.ConstantTimeCompare(expectedMD5, computedMD5[:]) != 1 {
+		// Zero the key before returning error
+		for i := range clientKey {
+			clientKey[i] = 0
+		}
+		return nil, fmt.Errorf("SSE-C customer key MD5 mismatch")
 	}
 
 	return clientKey, nil
@@ -2138,6 +2684,7 @@ func parseSSECHeaders(r *http.Request) ([]byte, error) {
 
 // parseSSECHeadersForRead parses SSE-C headers for GET/HEAD requests.
 // It requires all three SSE-C headers to be present if the object was encrypted with SSE-C.
+// Per S3 spec, the x-amz-server-side-encryption-customer-key-MD5 header is required.
 func parseSSECHeadersForRead(r *http.Request) ([]byte, error) {
 	algorithm := r.Header.Get("x-amz-server-side-encryption-customer-algorithm")
 	keyB64 := r.Header.Get("x-amz-server-side-encryption-customer-key")
@@ -2153,6 +2700,11 @@ func parseSSECHeadersForRead(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("invalid SSE-C algorithm: must be AES256")
 	}
 
+	// Key is required when algorithm is specified
+	if keyB64 == "" {
+		return nil, fmt.Errorf("SSE-C customer key is required when algorithm is specified")
+	}
+
 	// Decode the customer key
 	clientKey, err := base64.StdEncoding.DecodeString(keyB64)
 	if err != nil {
@@ -2161,19 +2713,37 @@ func parseSSECHeadersForRead(r *http.Request) ([]byte, error) {
 
 	// Validate key length (must be 32 bytes for AES-256)
 	if len(clientKey) != 32 {
+		// Zero the key before returning error
+		for i := range clientKey {
+			clientKey[i] = 0
+		}
 		return nil, fmt.Errorf("invalid SSE-C customer key: must be 256-bit (32 bytes)")
 	}
 
-	// Validate MD5 if provided
-	if keyMD5B64 != "" {
-		expectedMD5, err := base64.StdEncoding.DecodeString(keyMD5B64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid SSE-C customer key MD5: not valid base64")
+	// MD5 header is required per S3 spec for SSE-C
+	if keyMD5B64 == "" {
+		// Zero the key before returning error
+		for i := range clientKey {
+			clientKey[i] = 0
 		}
-		computedMD5 := md5.Sum(clientKey)
-		if !bytes.Equal(expectedMD5, computedMD5[:]) {
-			return nil, fmt.Errorf("SSE-C customer key MD5 mismatch")
+		return nil, fmt.Errorf("SSE-C customer key MD5 is required")
+	}
+
+	expectedMD5, err := base64.StdEncoding.DecodeString(keyMD5B64)
+	if err != nil {
+		// Zero the key before returning error
+		for i := range clientKey {
+			clientKey[i] = 0
 		}
+		return nil, fmt.Errorf("invalid SSE-C customer key MD5: not valid base64")
+	}
+	computedMD5 := md5.Sum(clientKey)
+	if subtle.ConstantTimeCompare(expectedMD5, computedMD5[:]) != 1 {
+		// Zero the key before returning error
+		for i := range clientKey {
+			clientKey[i] = 0
+		}
+		return nil, fmt.Errorf("SSE-C customer key MD5 mismatch")
 	}
 
 	return clientKey, nil

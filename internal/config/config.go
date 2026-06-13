@@ -7,6 +7,78 @@ import (
 	"github.com/spf13/viper"
 )
 
+type RaftConfig struct {
+	Enabled         bool     `mapstructure:"enabled"`
+	DataDir         string   `mapstructure:"data_dir"`
+	NodeID          string   `mapstructure:"node_id"`
+	ListenAddr      string   `mapstructure:"listen_addr"`
+	Peers           []string `mapstructure:"peers"`
+	SnapshotCount   int      `mapstructure:"snapshot_count"`
+	Heartbeat       string   `mapstructure:"heartbeat"`
+	ElectionTimeout string   `mapstructure:"election_timeout"`
+}
+
+// FTSConfig defines the configuration for full-text search.
+type FTSConfig struct {
+	Enabled      bool    `mapstructure:"enabled"`
+	DataDir      string  `mapstructure:"data_dir"`
+	MaxIndexSize string  `mapstructure:"max_index_size"`
+	SegmentSize  int     `mapstructure:"segment_size"`
+	BM25K1       float64 `mapstructure:"bm25_k1"`
+	BM25B        float64 `mapstructure:"bm25_b"`
+}
+
+// BackupConfig defines the configuration for backup and recovery.
+type BackupConfig struct {
+	Enabled        bool   `mapstructure:"enabled"`
+	Dir            string `mapstructure:"dir"`
+	Interval       string `mapstructure:"interval"`
+	RetentionDays  []int  `mapstructure:"retention_days"`
+	RemoteType     string `mapstructure:"remote_type"`
+	RemoteEndpoint string `mapstructure:"remote_endpoint"`
+	RemoteBucket   string `mapstructure:"remote_bucket"`
+	RemotePrefix   string `mapstructure:"remote_prefix"`
+	EncryptionKeyID string `mapstructure:"encryption_key_id"`
+}
+
+// StorageClassConfig defines the backend configuration for a storage class.
+type StorageClassConfig struct {
+	BackendType string `mapstructure:"backend_type"` // "file", "s3", "azure", "erasure"
+	BackendPath string `mapstructure:"backend_path"` // for file backend
+	// S3 configuration
+	S3Endpoint      string `mapstructure:"s3_endpoint"`
+	S3Region        string `mapstructure:"s3_region"`
+	S3Bucket        string `mapstructure:"s3_bucket"`
+	S3AccessKey     string `mapstructure:"s3_access_key"`
+	S3SecretKey     string `mapstructure:"s3_secret_key"`
+	S3ForcePathStyle bool  `mapstructure:"s3_force_path_style"`
+	// Azure configuration
+	AzureAccountName string `mapstructure:"azure_account_name"`
+	AzureAccountKey  string `mapstructure:"azure_account_key"`
+	AzureContainer   string `mapstructure:"azure_container"`
+	AzureEndpoint    string `mapstructure:"azure_endpoint"`
+	// Erasure coding configuration
+	ErasureDataShards   int `mapstructure:"erasure_data_shards"`
+	ErasureParityShards int `mapstructure:"erasure_parity_shards"`
+}
+
+type ObservabilityConfig struct {
+	MetricsEnabled      bool   `mapstructure:"metrics_enabled"`
+	MetricsPath         string `mapstructure:"metrics_path"`
+	TracingEnabled      bool   `mapstructure:"tracing_enabled"`
+	TracingEndpoint     string `mapstructure:"tracing_endpoint"`
+	TracingServiceName  string `mapstructure:"tracing_service_name"`
+	TracingInsecure     bool   `mapstructure:"tracing_insecure"`
+}
+
+type ResumableConfig struct {
+	Enabled         bool   `mapstructure:"enabled"`
+	UploadDir       string `mapstructure:"upload_dir"`
+	DefaultExpiry   string `mapstructure:"default_expiry"`
+	CleanupInterval string `mapstructure:"cleanup_interval"`
+	MaxSessionSize  string `mapstructure:"max_session_size"`
+}
+
 type Config struct {
 	Version        string           `mapstructure:"version"`
 	Node           NodeConfig       `mapstructure:"node"`
@@ -24,6 +96,12 @@ type Config struct {
 	RateLimit      RateLimitConfig   `mapstructure:"ratelimit"`
 	Replication    ReplicationConfig `mapstructure:"replication"`
 	Events         EventsConfig      `mapstructure:"events"`
+	Observability  ObservabilityConfig `mapstructure:"observability"`
+	StorageClasses map[string]StorageClassConfig `mapstructure:"storage_classes"`
+	Raft           RaftConfig         `mapstructure:"raft"`
+	Backup         BackupConfig       `mapstructure:"backup"`
+	FTS            FTSConfig          `mapstructure:"fts"`
+	Resumable      ResumableConfig    `mapstructure:"resumable"`
 }
 
 type ReplicationConfig struct {
@@ -107,14 +185,15 @@ type TieringConfig struct {
 }
 
 type EncryptionConfig struct {
-	KMSType         string `mapstructure:"kms_type"`
-	VaultAddr       string `mapstructure:"vault_addr"`
-	VaultTokenFile  string `mapstructure:"vault_token_file"`
-	VaultTransitKey string `mapstructure:"vault_transit_key"`
-	AWSKMSKeyID     string `mapstructure:"aws_kms_key_id"`
-	AWSRegion       string `mapstructure:"aws_region"`
-	EnableDedup     bool   `mapstructure:"enable_dedup"`
-	MasterKeyPath   string `mapstructure:"master_key_path"`
+	KMSType           string `mapstructure:"kms_type"`
+	VaultAddr         string `mapstructure:"vault_addr"`
+	VaultTokenFile    string `mapstructure:"vault_token_file"`
+	VaultTransitKey   string `mapstructure:"vault_transit_key"`
+	AWSKMSKeyID       string `mapstructure:"aws_kms_key_id"`
+	AWSRegion         string `mapstructure:"aws_region"`
+	KMSDegradationMode string `mapstructure:"kms_degradation_mode"` // "reject_writes" or "read_only"
+	EnableDedup       bool   `mapstructure:"enable_dedup"`
+	MasterKeyPath     string `mapstructure:"master_key_path"`
 }
 
 // CryptoServicesConfig for distributed crypto microservices
@@ -139,25 +218,31 @@ type CryptoServicesConfig struct {
 }
 
 type VectorConfig struct {
-	Enabled              bool   `mapstructure:"enabled"`
-	HotIndexSize         string `mapstructure:"hot_index_size"`
-	ModelDir             string `mapstructure:"model_dir"`
-	Dimension            int    `mapstructure:"dim"`
-	HotIndexBytes        int64  `mapstructure:"-"`
-	IndexType            string `mapstructure:"index_type"`
-	MetricType           string `mapstructure:"metric_type"`
-	MaxVectors           int64  `mapstructure:"max_vectors"`
-	EmbeddingProvider    string `mapstructure:"embedding_provider"`
-	EmbeddingModelPath   string `mapstructure:"embedding_model_path"`
-	EmbeddingAPIEndpoint string `mapstructure:"embedding_api_endpoint"`
-	EmbeddingAPIKey      string `mapstructure:"embedding_api_key"`
-	EmbeddingModelName   string `mapstructure:"embedding_model_name"`
-	AutoIndex            bool   `mapstructure:"auto_index"`
-	MaxSearchTopK        int    `mapstructure:"max_search_top_k"`
-	MaxQueryLength       int    `mapstructure:"max_query_length"`
-	RequireAuth          bool   `mapstructure:"require_auth"`
+	Enabled              bool     `mapstructure:"enabled"`
+	HotIndexSize         string   `mapstructure:"hot_index_size"`
+	ModelDir             string   `mapstructure:"model_dir"`
+	Dimension            int      `mapstructure:"dim"`
+	HotIndexBytes        int64    `mapstructure:"-"`
+	IndexType            string   `mapstructure:"index_type"`
+	MetricType           string   `mapstructure:"metric_type"`
+	MaxVectors           int64    `mapstructure:"max_vectors"`
+	EmbeddingProvider    string   `mapstructure:"embedding_provider"`
+	EmbeddingModelPath   string   `mapstructure:"embedding_model_path"`
+	EmbeddingAPIEndpoint string   `mapstructure:"embedding_api_endpoint"`
+	EmbeddingAPIKey      string   `mapstructure:"embedding_api_key"`
+	EmbeddingModelName   string   `mapstructure:"embedding_model_name"`
+	AutoIndex            bool     `mapstructure:"auto_index"`
+	MaxSearchTopK        int      `mapstructure:"max_search_top_k"`
+	MaxQueryLength       int      `mapstructure:"max_query_length"`
+	RequireAuth          bool     `mapstructure:"require_auth"`
 	AllowedContentTypes  []string `mapstructure:"allowed_content_types"`
-	MaxIndexContentSize  int64  `mapstructure:"max_index_content_size"`
+	MaxIndexContentSize  int64    `mapstructure:"max_index_content_size"`
+	MMapEnabled          bool     `mapstructure:"mmap_enabled"`
+	QuantizationType     string   `mapstructure:"quantization_type"`
+	PQSubquantizers      int      `mapstructure:"pq_subquantizers"`
+	IndexDataDir         string   `mapstructure:"index_data_dir"`
+	RebuildInterval      string   `mapstructure:"rebuild_interval"`
+	FallbackMinutes      int      `mapstructure:"fallback_minutes"`
 }
 
 type PipelineConfig struct {
@@ -205,6 +290,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("tiering.hot_max_size", "32GB")
 	viper.SetDefault("encryption.enable_dedup", true)
 	viper.SetDefault("encryption.vault_transit_key", "nexus")
+	viper.SetDefault("encryption.kms_degradation_mode", "reject_writes")
 	viper.SetDefault("crypto_services.enabled", false)
 	viper.SetDefault("crypto_services.distributed_mode", false)
 	viper.SetDefault("crypto_services.audit_size", 10000)
@@ -216,6 +302,12 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("vector.max_query_length", 10000)
 	viper.SetDefault("vector.require_auth", true)
 	viper.SetDefault("vector.max_index_content_size", 1048576) // 1MB
+	viper.SetDefault("vector.mmap_enabled", false)
+	viper.SetDefault("vector.quantization_type", "none")
+	viper.SetDefault("vector.pq_subquantizers", 8)
+	viper.SetDefault("vector.index_data_dir", "data/vector")
+	viper.SetDefault("vector.rebuild_interval", "1h")
+	viper.SetDefault("vector.fallback_minutes", 5)
 	viper.SetDefault("cache.policy", "tinyLFU")
 	viper.SetDefault("cache.metadata_max_size", "10GB")
 	viper.SetDefault("cache.object_max_size", "30GB")
@@ -248,6 +340,36 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("events.retry_base_ms", 1000)
 	viper.SetDefault("events.webhook_timeout", "5s")
 	viper.SetDefault("events.dead_letter_dir", "data/deadletter")
+	viper.SetDefault("observability.metrics_enabled", true)
+	viper.SetDefault("observability.metrics_path", "/metrics")
+	viper.SetDefault("observability.tracing_enabled", false)
+	viper.SetDefault("observability.tracing_endpoint", "localhost:4317")
+	viper.SetDefault("observability.tracing_service_name", "nexus")
+	viper.SetDefault("observability.tracing_insecure", true)
+	viper.SetDefault("backup.enabled", false)
+	viper.SetDefault("backup.dir", "data/backups")
+	viper.SetDefault("backup.interval", "24h")
+	viper.SetDefault("backup.retention_days", []int{1, 7, 30})
+	viper.SetDefault("backup.remote_type", "local")
+	viper.SetDefault("backup.encryption_key_id", "nexus-backup-key")
+	viper.SetDefault("raft.enabled", false)
+	viper.SetDefault("raft.data_dir", "/var/lib/nexus/raft")
+	viper.SetDefault("raft.node_id", "node1")
+	viper.SetDefault("raft.listen_addr", ":9090")
+	viper.SetDefault("raft.snapshot_count", 8192)
+	viper.SetDefault("raft.heartbeat", "1s")
+	viper.SetDefault("raft.election_timeout", "1s")
+	viper.SetDefault("fts.enabled", false)
+	viper.SetDefault("fts.data_dir", "/var/lib/nexus/fts")
+	viper.SetDefault("fts.max_index_size", "10GB")
+	viper.SetDefault("fts.segment_size", 1024)
+	viper.SetDefault("fts.bm25_k1", 1.2)
+	viper.SetDefault("fts.bm25_b", 0.75)
+	viper.SetDefault("resumable.enabled", false)
+	viper.SetDefault("resumable.upload_dir", "data/uploads")
+	viper.SetDefault("resumable.default_expiry", "24h")
+	viper.SetDefault("resumable.cleanup_interval", "5m")
+	viper.SetDefault("resumable.max_session_size", "100GB")
 
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("failed to read config: %w", err)

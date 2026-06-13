@@ -135,6 +135,7 @@ func TestWebhookSender_Send_Success(t *testing.T) {
 	}
 
 	sender := NewWebhookSender(5 * time.Second)
+	sender.ssrfBypass = true // bypass SSRF for localhost test server
 	dest := DestinationConfig{
 		Type: "webhook",
 		URL:  server.URL,
@@ -181,6 +182,7 @@ func TestWebhookSender_Send_5xxRetryable(t *testing.T) {
 	defer server.Close()
 
 	sender := NewWebhookSender(5 * time.Second)
+	sender.ssrfBypass = true // bypass SSRF for localhost test server
 	dest := DestinationConfig{Type: "webhook", URL: server.URL}
 	event := &Event{EventType: "s3:ObjectCreated:Put", Key: "test.txt"}
 
@@ -196,6 +198,7 @@ func TestWebhookSender_Send_4xxNonRetryable(t *testing.T) {
 	defer server.Close()
 
 	sender := NewWebhookSender(5 * time.Second)
+	sender.ssrfBypass = true // bypass SSRF for localhost test server
 	dest := DestinationConfig{Type: "webhook", URL: server.URL}
 	event := &Event{EventType: "s3:ObjectCreated:Put", Key: "test.txt"}
 
@@ -211,6 +214,7 @@ func TestWebhookSender_Send_429Retryable(t *testing.T) {
 	defer server.Close()
 
 	sender := NewWebhookSender(5 * time.Second)
+	sender.ssrfBypass = true // bypass SSRF for localhost test server
 	dest := DestinationConfig{Type: "webhook", URL: server.URL}
 	event := &Event{EventType: "s3:ObjectCreated:Put", Key: "test.txt"}
 
@@ -232,6 +236,7 @@ func TestEventBus_PublishAndSubscribe(t *testing.T) {
 
 	bus := NewEventBus(4, 5*time.Second, t.TempDir(), 3, 100)
 	bus.Start()
+	bus.SetSSRFBypass(true) // bypass SSRF for localhost test server
 	defer bus.Stop()
 
 	rule := &NotificationRule{
@@ -269,6 +274,7 @@ func TestEventBus_Unsubscribe(t *testing.T) {
 
 	bus := NewEventBus(4, 5*time.Second, t.TempDir(), 3, 100)
 	bus.Start()
+	bus.SetSSRFBypass(true) // bypass SSRF for localhost test server
 	defer bus.Stop()
 
 	rule := &NotificationRule{
@@ -305,6 +311,7 @@ func TestEventBus_NoMatchingSubscribers(t *testing.T) {
 
 	bus := NewEventBus(4, 5*time.Second, t.TempDir(), 3, 100)
 	bus.Start()
+	bus.SetSSRFBypass(true) // bypass SSRF for localhost test server
 	defer bus.Stop()
 
 	rule := &NotificationRule{
@@ -386,6 +393,7 @@ func TestDeadLetterQueue_RetryThenDeadLetter(t *testing.T) {
 
 	dlq := NewDeadLetterQueue(dir, 3, 100, metrics)
 	sender := NewWebhookSender(5 * time.Second)
+	sender.ssrfBypass = true // bypass SSRF for localhost test server
 	dlq.Start(sender)
 	defer dlq.Stop()
 
@@ -433,6 +441,7 @@ func TestEventBus_KeyBasedOrdering(t *testing.T) {
 
 	bus := NewEventBus(4, 5*time.Second, t.TempDir(), 3, 100)
 	bus.Start()
+	bus.SetSSRFBypass(true) // bypass SSRF for localhost test server
 	defer bus.Stop()
 
 	rule := &NotificationRule{
@@ -487,6 +496,7 @@ func TestEventBus_DifferentKeysCanProcessConcurrently(t *testing.T) {
 
 	bus := NewEventBus(16, 5*time.Second, t.TempDir(), 3, 100)
 	bus.Start()
+	bus.SetSSRFBypass(true) // bypass SSRF for localhost test server
 	defer bus.Stop()
 
 	rule := &NotificationRule{

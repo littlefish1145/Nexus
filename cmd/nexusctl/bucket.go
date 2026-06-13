@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -144,46 +145,7 @@ func getAuthHeader() string {
 	}
 
 	creds := fmt.Sprintf("%s:%s", ak, sk)
-	return "Basic " + base64Encode(creds)
-}
-
-func base64Encode(s string) string {
-	return strings.TrimRight(fmt.Sprintf("%s", encodeBase64([]byte(s))), "=")
-}
-
-func encodeBase64(src []byte) string {
-	const encodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	const paddingChar = '='
-
-	if len(src) == 0 {
-		return ""
-	}
-
-	dst := make([]byte, (len(src)+2)/3*4)
-	for i, j := 0, 0; i < len(src); i, j = i+3, j+4 {
-		var val uint32
-		switch len(src) - i {
-		case 1:
-			val = uint32(src[i]) << 16
-			dst[j] = encodeStd[val>>18&0x3F]
-			dst[j+1] = encodeStd[val>>12&0x3F]
-			dst[j+2] = paddingChar
-			dst[j+3] = paddingChar
-		case 2:
-			val = uint32(src[i])<<16 | uint32(src[i+1])<<8
-			dst[j] = encodeStd[val>>18&0x3F]
-			dst[j+1] = encodeStd[val>>12&0x3F]
-			dst[j+2] = encodeStd[val>>6&0x3F]
-			dst[j+3] = paddingChar
-		default:
-			val = uint32(src[i])<<16 | uint32(src[i+1])<<8 | uint32(src[i+2])
-			dst[j] = encodeStd[val>>18&0x3F]
-			dst[j+1] = encodeStd[val>>12&0x3F]
-			dst[j+2] = encodeStd[val>>6&0x3F]
-			dst[j+3] = encodeStd[val&0x3F]
-		}
-	}
-	return string(dst)
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
 }
 
 func runBucketCreate(cmd *cobra.Command, args []string) error {

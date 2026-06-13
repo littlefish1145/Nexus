@@ -4,7 +4,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +14,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/hkdf"
+	"nexus/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -124,15 +128,20 @@ func checkConfigPermissions(path string) {
 	}
 }
 
-// deriveEncryptionKey derives a 32-byte AES key from the machine ID.
+// deriveEncryptionKey derives a 32-byte AES key from the machine ID using HKDF.
+// This is more secure than simple padding/truncation as it properly distributes
+// entropy across the full key length.
 func deriveEncryptionKey() ([]byte, error) {
 	machineID, err := readMachineID()
 	if err != nil {
 		machineID = "nexusctl-default-key"
 	}
-	// Simple key derivation: pad or truncate to 32 bytes
+
+	h := hkdf.New(sha256.New, []byte(machineID), []byte("nexusctl-config-encryption"), nil)
 	key := make([]byte, 32)
-	copy(key, []byte(machineID))
+	if _, err := io.ReadFull(h, key); err != nil {
+		return nil, fmt.Errorf("failed to derive encryption key: %w", err)
+	}
 	return key, nil
 }
 
@@ -283,20 +292,20 @@ var configGetCmd = &cobra.Command{
 		}
 
 		var value string
-		switch key {
-		case "address":
-			value = cfg.Address
-		case "access_key":
-			value = cfg.AccessKey
-		case "secret_key":
-			value = cfg.SecretKey
-		case "region":
-			value = cfg.Region
-		case "output":
-			value = cfg.Output
-		default:
-			return fmt.Errorf("invalid config key '%s'. Valid keys: address, access_key, secret_key, region, output", key)
-		}
+	switch key {
+	case "address":
+		value = cfg.Address
+	case "access_key":
+		value = maskSensitive(cfg.AccessKey)
+	case "secret_key":
+		value = maskSensitive(cfg.SecretKey)
+	case "region":
+		value = cfg.Region
+	case "output":
+		value = cfg.Output
+	default:
+		return fmt.Errorf("invalid config key '%s'. Valid keys: address, access_key, secret_key, region, output", key)
+	}
 
 		out, err := formatOutput(map[string]string{key: value}, outputFmt, queryStr)
 		if err != nil {
@@ -345,9 +354,99 @@ func maskSensitive(s string) string {
 	return s[:4] + "****" + s[len(s)-4:]
 }
 
+var configValidateCmd = &cobra.Command{
+	Use:   "validate",
+	Short: "Validate a Nexus server configuration file",
+	Long:  "Validate a Nexus server configuration file against the schema and report errors and warnings",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		file, _ := cmd.Flags().GetString("file")
+		if file == "" {
+			return fmt.Errorf("--file flag is required")
+		}
+
+		cfg, err := config.Load(file)
+		if err != nil {
+			return fmt.Errorf("failed to load config: %w", err)
+		}
+
+		errs := config.Validate(cfg)
+
+		outputJSON, _ := cmd.Flags().GetBool("output-json")
+
+		if outputJSON {
+			return printValidationJSON(errs)
+		}
+
+		return printValidationText(errs)
+	},
+}
+
+func printValidationJSON(errs []config.ValidationError) error {
+	type validationOutput struct {
+		Valid    bool                    `json:"valid"`
+		Errors   []config.ValidationError `json:"errors"`
+		Warnings []config.ValidationError `json:"warnings"`
+	}
+
+	output := validationOutput{
+		Valid:    !config.HasErrors(errs),
+		Errors:   []config.ValidationError{},
+		Warnings: []config.ValidationError{},
+	}
+
+	for _, e := range errs {
+		if e.Severity == "error" {
+			output.Errors = append(output.Errors, e)
+		} else {
+			output.Warnings = append(output.Warnings, e)
+		}
+	}
+
+	b, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal output: %w", err)
+	}
+	fmt.Println(string(b))
+
+	if output.Valid {
+		return nil
+	}
+	// Return a non-nil error to trigger exit code 1
+	return fmt.Errorf("validation failed with %d error(s)", len(output.Errors))
+}
+
+func printValidationText(errs []config.ValidationError) error {
+	var errorCount, warningCount int
+	for _, e := range errs {
+		switch e.Severity {
+		case "error":
+			fmt.Fprintf(os.Stderr, "ERROR: %s\n", e)
+			errorCount++
+		case "warning":
+			fmt.Fprintf(os.Stderr, "WARNING: %s\n", e)
+			warningCount++
+		}
+	}
+
+	if len(errs) == 0 {
+		fmt.Println("Configuration is valid.")
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "\n%d error(s), %d warning(s)\n", errorCount, warningCount)
+
+	if errorCount > 0 {
+		return fmt.Errorf("validation failed with %d error(s)", errorCount)
+	}
+	return nil
+}
+
 func init() {
 	rootCmd.AddCommand(configCmd)
 	configCmd.AddCommand(configSetCmd)
 	configCmd.AddCommand(configGetCmd)
 	configCmd.AddCommand(configListCmd)
+	configCmd.AddCommand(configValidateCmd)
+	configValidateCmd.Flags().StringP("file", "f", "", "Path to the Nexus server config file to validate")
+	configValidateCmd.Flags().Bool("output-json", false, "Output validation results in JSON format")
 }

@@ -21,6 +21,7 @@ encryption:
   vault_transit_key: "nexus"
   aws_kms_key_id: ""
   aws_region: "us-east-1"
+  kms_degradation_mode: "reject_writes"
   enable_dedup: true
   master_key_path: "./data/master.key"
 

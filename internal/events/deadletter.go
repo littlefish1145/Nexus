@@ -3,6 +3,7 @@ package events
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -135,6 +136,7 @@ func (q *DeadLetterQueue) retryLoop(sender *WebhookSender) {
 // writeToDisk persists a dead letter entry as a JSON file.
 func (q *DeadLetterQueue) writeToDisk(entry *DeadLetterEntry) {
 	if err := os.MkdirAll(q.dir, 0755); err != nil {
+		log.Printf("[nexus] DLQ: failed to create directory %s: %v", q.dir, err)
 		return
 	}
 
@@ -143,8 +145,11 @@ func (q *DeadLetterQueue) writeToDisk(entry *DeadLetterEntry) {
 
 	data, err := json.MarshalIndent(entry, "", "  ")
 	if err != nil {
+		log.Printf("[nexus] DLQ: failed to marshal entry %s: %v", entry.ID, err)
 		return
 	}
 
-	os.WriteFile(path, data, 0644)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		log.Printf("[nexus] DLQ: failed to write entry to %s: %v", path, err)
+	}
 }

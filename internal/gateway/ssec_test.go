@@ -40,10 +40,13 @@ func TestParseSSECHeaders_InvalidAlgorithm(t *testing.T) {
 	_, _ = rand.Read(clientKey)
 
 	keyB64 := base64.StdEncoding.EncodeToString(clientKey)
+	md5Hash := md5.Sum(clientKey)
+	keyMD5B64 := base64.StdEncoding.EncodeToString(md5Hash[:])
 
 	req := httptest.NewRequest("PUT", "/bucket/key", nil)
 	req.Header.Set("x-amz-server-side-encryption-customer-algorithm", "AES128")
 	req.Header.Set("x-amz-server-side-encryption-customer-key", keyB64)
+	req.Header.Set("x-amz-server-side-encryption-customer-key-MD5", keyMD5B64)
 
 	key, err := parseSSECHeaders(req)
 	assert.Error(t, err)
@@ -56,10 +59,13 @@ func TestParseSSECHeaders_InvalidKeySize(t *testing.T) {
 	_, _ = rand.Read(shortKey)
 
 	keyB64 := base64.StdEncoding.EncodeToString(shortKey)
+	md5Hash := md5.Sum(shortKey)
+	keyMD5B64 := base64.StdEncoding.EncodeToString(md5Hash[:])
 
 	req := httptest.NewRequest("PUT", "/bucket/key", nil)
 	req.Header.Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
 	req.Header.Set("x-amz-server-side-encryption-customer-key", keyB64)
+	req.Header.Set("x-amz-server-side-encryption-customer-key-MD5", keyMD5B64)
 
 	key, err := parseSSECHeaders(req)
 	assert.Error(t, err)
@@ -94,6 +100,7 @@ func TestParseSSECHeaders_InvalidBase64Key(t *testing.T) {
 	req := httptest.NewRequest("PUT", "/bucket/key", nil)
 	req.Header.Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
 	req.Header.Set("x-amz-server-side-encryption-customer-key", "not-valid-base64!!!")
+	req.Header.Set("x-amz-server-side-encryption-customer-key-MD5", "AAAA")
 
 	key, err := parseSSECHeaders(req)
 	assert.Error(t, err)
@@ -116,6 +123,23 @@ func TestParseSSECHeaders_InvalidBase64MD5(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, key)
 	assert.Contains(t, err.Error(), "base64")
+}
+
+func TestParseSSECHeaders_MissingMD5(t *testing.T) {
+	clientKey := make([]byte, 32)
+	_, _ = rand.Read(clientKey)
+
+	keyB64 := base64.StdEncoding.EncodeToString(clientKey)
+
+	req := httptest.NewRequest("PUT", "/bucket/key", nil)
+	req.Header.Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
+	req.Header.Set("x-amz-server-side-encryption-customer-key", keyB64)
+	// No MD5 header - should be required per S3 spec
+
+	key, err := parseSSECHeaders(req)
+	assert.Error(t, err)
+	assert.Nil(t, key)
+	assert.Contains(t, err.Error(), "MD5 is required")
 }
 
 func TestParseSSECHeadersForRead_NoHeaders(t *testing.T) {
@@ -218,4 +242,5 @@ func TestSSECHeaders_AlgorithmOnlyNoKey(t *testing.T) {
 	key, err := parseSSECHeaders(req)
 	assert.Error(t, err)
 	assert.Nil(t, key)
+	assert.Contains(t, err.Error(), "key is required")
 }

@@ -68,7 +68,8 @@ func (w *eventWorker) enqueue(delivery *eventDelivery) {
 	select {
 	case w.ch <- delivery:
 	default:
-		// Drop if worker is overwhelmed
+		// Worker is overwhelmed - track the dropped event for monitoring
+		w.metrics.IncDropped()
 	}
 }
 
@@ -157,6 +158,12 @@ func (b *EventBus) Start() {
 	b.dlq.Start(b.sender)
 
 	go b.dispatchLoop()
+}
+
+// SetSSRFBypass enables or disables SSRF URL validation on the webhook sender.
+// This should only be set to true for testing with local HTTP servers.
+func (b *EventBus) SetSSRFBypass(bypass bool) {
+	b.sender.ssrfBypass = bypass
 }
 
 // Stop gracefully shuts down the event bus.
