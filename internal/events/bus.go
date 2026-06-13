@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"hash/fnv"
+	"log"
 	"sync"
 	"time"
 
@@ -42,16 +43,18 @@ type eventWorker struct {
 	sender  *WebhookSender
 	dlq     *DeadLetterQueue
 	metrics *Metrics
+	drainWg *sync.WaitGroup
 	stopCh  chan struct{}
 }
 
-func newEventWorker(id int, sender *WebhookSender, dlq *DeadLetterQueue, metrics *Metrics) *eventWorker {
+func newEventWorker(id int, sender *WebhookSender, dlq *DeadLetterQueue, metrics *Metrics, drainWg *sync.WaitGroup) *eventWorker {
 	return &eventWorker{
 		id:      id,
 		ch:      make(chan *eventDelivery, 256),
 		sender:  sender,
 		dlq:     dlq,
 		metrics: metrics,
+		drainWg: drainWg,
 		stopCh:  make(chan struct{}),
 	}
 }
@@ -70,6 +73,8 @@ func (w *eventWorker) enqueue(delivery *eventDelivery) {
 	default:
 		// Worker is overwhelmed - track the dropped event for monitoring
 		w.metrics.IncDropped()
+		// Decrement drainWg since this event will never be delivered
+		w.drainWg.Done()
 	}
 }
 
@@ -85,6 +90,8 @@ func (w *eventWorker) processLoop() {
 }
 
 func (w *eventWorker) deliver(delivery *eventDelivery) {
+	defer w.drainWg.Done()
+
 	event := delivery.event
 	for _, rule := range delivery.rules {
 		switch rule.Destination.Type {
@@ -119,6 +126,7 @@ type EventBus struct {
 	metrics       *Metrics
 	eventCh       chan *Event
 	stopCh        chan struct{}
+	drainWg       sync.WaitGroup // tracks in-flight events from Publish to delivery completion
 }
 
 // NewEventBus creates a new EventBus with the given configuration.
@@ -144,7 +152,7 @@ func NewEventBus(numWorkers int, webhookTimeout time.Duration, dlqDir string, ma
 	// Create worker goroutines for key-based sharding
 	bus.workers = make([]*eventWorker, numWorkers)
 	for i := 0; i < numWorkers; i++ {
-		bus.workers[i] = newEventWorker(i, sender, dlq, metrics)
+		bus.workers[i] = newEventWorker(i, sender, dlq, metrics, &bus.drainWg)
 	}
 
 	return bus
@@ -167,8 +175,24 @@ func (b *EventBus) SetSSRFBypass(bypass bool) {
 }
 
 // Stop gracefully shuts down the event bus.
+// It waits up to 30 seconds for in-flight events to be delivered before closing channels.
 func (b *EventBus) Stop() {
 	close(b.stopCh)
+
+	// Wait for in-flight events to drain with a 30-second timeout
+	drained := make(chan struct{})
+	go func() {
+		b.drainWg.Wait()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		// All in-flight events delivered successfully
+	case <-time.After(30 * time.Second):
+		log.Printf("[nexus] EventBus: drain timeout expired, some events may have been lost")
+	}
+
 	b.dlq.Stop()
 	for _, w := range b.workers {
 		w.stop()
@@ -184,9 +208,12 @@ func (b *EventBus) Publish(ctx context.Context, event *Event) {
 		event.Timestamp = time.Now()
 	}
 
+	b.drainWg.Add(1)
+
 	select {
 	case b.eventCh <- event:
 	case <-ctx.Done():
+		b.drainWg.Done()
 	}
 }
 
@@ -238,6 +265,8 @@ func (b *EventBus) dispatchLoop() {
 		case event := <-b.eventCh:
 			rules := b.getMatchingRules(event)
 			if len(rules) == 0 {
+				// No matching rules, event will not be delivered - decrement drainWg
+				b.drainWg.Done()
 				continue
 			}
 

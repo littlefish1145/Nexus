@@ -747,28 +747,36 @@ func (g *S3Gateway) handleBucketOperations(bucket, method string) func(w http.Re
 		query := r.URL.Query()
 
 		switch method {
-		case "PUT":
-			if query.Has("acl") {
-				if _, err := g.auth.RequireAuthForBucket(r, bucket, "admin"); err != nil {
-					return fmt.Errorf("access denied: %w", err)
-				}
-				return g.handlePutBucketAcl(w, r, bucket)
-			}
-			if _, err := g.auth.RequireAuthForBucket(r, bucket, "write"); err != nil {
-				return fmt.Errorf("access denied: %w", err)
-			}
-			return g.handleCreateBucket(w, r, bucket)
-		case "DELETE":
+	case "PUT":
+		if query.Has("acl") {
 			if _, err := g.auth.RequireAuthForBucket(r, bucket, "admin"); err != nil {
 				return fmt.Errorf("access denied: %w", err)
 			}
-			return g.handleDeleteBucket(w, r, bucket)
-		case "HEAD":
-			if _, err := g.auth.RequireAuthForBucket(r, bucket, "read"); err != nil {
+			return g.handlePutBucketAcl(w, r, bucket)
+		}
+		if _, err := g.auth.RequireAuthForBucket(r, bucket, "write"); err != nil {
+			return fmt.Errorf("access denied: %w", err)
+		}
+		return g.handleCreateBucket(w, r, bucket)
+	case "DELETE":
+		if _, err := g.auth.RequireAuthForBucket(r, bucket, "admin"); err != nil {
+			return fmt.Errorf("access denied: %w", err)
+		}
+		return g.handleDeleteBucket(w, r, bucket)
+	case "HEAD":
+		if _, err := g.auth.RequireAuthForBucket(r, bucket, "read"); err != nil {
+			return fmt.Errorf("access denied: %w", err)
+		}
+		return g.handleHeadBucket(w, r, bucket)
+	case "POST":
+		if query.Has("delete") {
+			if _, err := g.auth.RequireAuthForBucket(r, bucket, "delete"); err != nil {
 				return fmt.Errorf("access denied: %w", err)
 			}
-			return g.handleHeadBucket(w, r, bucket)
-		case "GET":
+			return g.handleDeleteObjects(w, r, bucket)
+		}
+		return fmt.Errorf("unsupported POST operation on bucket")
+	case "GET":
 			if query.Has("location") {
 				return g.handleGetBucketLocation(w, r, bucket)
 			}
@@ -840,8 +848,11 @@ func (g *S3Gateway) handleObjectOperations(bucket, key, method string) func(w ht
 		}
 
 		switch method {
-		case "PUT":
-			return g.handlePutObject(w, r, bucket, key)
+	case "PUT":
+		if r.Header.Get("x-amz-copy-source") != "" {
+			return g.handleCopyObject(w, r, bucket, key)
+		}
+		return g.handlePutObject(w, r, bucket, key)
 		case "GET":
 			return g.handleGetObject(w, r, bucket, key)
 		case "HEAD":
@@ -1225,7 +1236,7 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 			clientKey[i] = 0
 		}
 		if err != nil {
-			return fmt.Errorf("SSE-C encryption failed: %w", err)
+			return fmt.Errorf("SSE-C encryption failed")
 		}
 		dataReader = encryptedReader
 		encryptedDEKMetadata = ssecMetadata
@@ -1527,7 +1538,7 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 	if objMetadata.SSECUsed {
 		clientKey, ssecErr := parseSSECHeadersForRead(r)
 		if ssecErr != nil {
-			g.writeError(w, http.StatusBadRequest, "InvalidRequest", ssecErr.Error())
+			g.writeError(w, http.StatusBadRequest, "InvalidRequest", "Invalid SSE-C customer key headers")
 			return nil
 		}
 		if clientKey == nil {
@@ -1569,7 +1580,6 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 		if rawFallback {
 			rawBackup, err = io.ReadAll(io.LimitReader(reader, g.config.Performance.MaxUploadBytes))
 			if err != nil {
-				fmt.Printf("[nexus] decryption error for %s/%s: failed to read raw data for fallback: %v\n", bucket, key, err)
 				g.writeError(w, http.StatusInternalServerError, "InternalError", "An internal error occurred while processing the object")
 				return nil
 			}
@@ -1578,7 +1588,6 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 
 		decryptedReader, err := g.cryptoCoordinator.DecryptOperation(r.Context(), userID, bucket, key, reader, "", encryptedDEKMetadata)
 		if err != nil {
-			fmt.Printf("[nexus] decryption error for %s/%s: %v\n", bucket, key, err)
 			if rawFallback && rawBackup != nil {
 				w.Header().Set("x-amz-decryption-fallback", "true")
 				dataReader = bytes.NewReader(rawBackup)
@@ -1906,6 +1915,276 @@ func (g *S3Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, b
 	}
 
 	return nil
+}
+
+// DeleteObjectsRequest represents the XML body of a DeleteObjects request.
+type DeleteObjectsRequest struct {
+	XMLName xml.Name             `xml:"Delete"`
+	Objects []DeleteObjectsObject `xml:"Object"`
+	Quiet   bool                 `xml:"Quiet,omitempty"`
+}
+
+// DeleteObjectsObject represents a single object in a DeleteObjects request.
+type DeleteObjectsObject struct {
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId,omitempty"`
+}
+
+// DeleteObjectsResult represents the XML response for DeleteObjects.
+type DeleteObjectsResult struct {
+	XMLName xml.Name              `xml:"DeleteResult"`
+	Deleted []DeleteObjectsDeleted `xml:"Deleted"`
+	Error   []DeleteObjectsError   `xml:"Error,omitempty"`
+}
+
+// DeleteObjectsDeleted represents a successfully deleted object in the response.
+type DeleteObjectsDeleted struct {
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId,omitempty"`
+}
+
+// DeleteObjectsError represents a failed deletion in the response.
+type DeleteObjectsError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+func (g *S3Gateway) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bucket string) error {
+	if r.Method != "POST" {
+		return fmt.Errorf("method not allowed")
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes))
+	if err != nil {
+		return fmt.Errorf("failed to read request body: %w", err)
+	}
+
+	var req DeleteObjectsRequest
+	if err := xml.Unmarshal(body, &req); err != nil {
+		return fmt.Errorf("failed to parse delete request: %w", err)
+	}
+
+	userID := g.auth.GetUserID(r)
+	if userID == "" {
+		userID = "anonymous"
+	}
+
+	result := DeleteObjectsResult{}
+
+	for _, obj := range req.Objects {
+		objMetadata, err := g.metadata.GetObject(r.Context(), bucket, obj.Key)
+		if err != nil {
+			if !req.Quiet {
+				result.Error = append(result.Error, DeleteObjectsError{
+					Key:     obj.Key,
+					Code:    "NoSuchKey",
+					Message: fmt.Sprintf("Object '%s' not found", obj.Key),
+				})
+			}
+			continue
+		}
+
+		storageTier := common.StorageTier(objMetadata.StorageTier)
+		g.store.Delete(r.Context(), bucket, obj.Key, storageTier)
+
+		if g.vector != nil {
+			g.vector.DeleteVector(r.Context(), bucket, obj.Key)
+		}
+
+		if g.ftsIndex != nil {
+			g.ftsIndex.DeleteDocumentByKey(bucket, obj.Key)
+		}
+
+		if g.objectCache != nil {
+			g.objectCache.Delete(r.Context(), bucket+"/"+obj.Key)
+		}
+
+		g.metadata.DeleteObject(r.Context(), bucket, obj.Key)
+
+		// Publish s3:ObjectRemoved:Delete event for each deleted key
+		if g.eventBus != nil {
+			g.eventBus.Publish(r.Context(), &events.Event{
+				EventType:    "s3:ObjectRemoved:Delete",
+				Bucket:       bucket,
+				Key:          obj.Key,
+				VersionID:    objMetadata.VersionID,
+				ETag:         objMetadata.ETag,
+				Size:         objMetadata.Size,
+				RequesterARN: userID,
+				SourceIP:     r.RemoteAddr,
+			})
+		}
+
+		result.Deleted = append(result.Deleted, DeleteObjectsDeleted{
+			Key:       obj.Key,
+			VersionID: objMetadata.VersionID,
+		})
+	}
+
+	g.auditLog(r, "DELETE_OBJECTS", bucket, "", userID, "success", map[string]interface{}{
+		"count": len(req.Objects),
+	})
+
+	return g.writeXML(w, http.StatusOK, result)
+}
+
+// CopyObjectResult represents the XML response for CopyObject.
+type CopyObjectResult struct {
+	XMLName      xml.Name `xml:"CopyObjectResult"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
+}
+
+func (g *S3Gateway) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	if r.Method != "PUT" {
+		return fmt.Errorf("method not allowed")
+	}
+
+	if _, err := g.auth.RequireAuthForBucket(r, bucket, "write"); err != nil {
+		return fmt.Errorf("access denied: %w", err)
+	}
+
+	copySource := r.Header.Get("x-amz-copy-source")
+	if copySource == "" {
+		return fmt.Errorf("missing x-amz-copy-source header")
+	}
+
+	// Parse copy source: /bucket/key or bucket/key
+	copySource = strings.TrimPrefix(copySource, "/")
+	parts := strings.SplitN(copySource, "/", 2)
+	if len(parts) < 2 {
+		return fmt.Errorf("invalid copy source format, expected /bucket/key")
+	}
+	srcBucket := parts[0]
+	srcKey := parts[1]
+
+	// Check read permission on source bucket
+	if _, err := g.auth.RequireAuthForBucket(r, srcBucket, "read"); err != nil {
+		return fmt.Errorf("access denied on source: %w", err)
+	}
+
+	// Get source object metadata
+	srcMeta, err := g.metadata.GetObject(r.Context(), srcBucket, srcKey)
+	if err != nil {
+		g.writeError(w, http.StatusNotFound, "NoSuchKey", fmt.Sprintf("Source object '%s/%s' not found", srcBucket, srcKey))
+		return nil
+	}
+
+	if srcMeta.DeleteMarker {
+		g.writeError(w, http.StatusNotFound, "NoSuchKey", "Source object has been deleted")
+		return nil
+	}
+
+	userID := g.auth.GetUserID(r)
+	if userID == "" {
+		userID = "anonymous"
+	}
+
+	// Read source object data
+	srcStorageTier := common.StorageTier(srcMeta.StorageTier)
+	srcReader, _, err := g.store.Get(r.Context(), srcBucket, srcKey, srcStorageTier)
+	if err != nil {
+		return fmt.Errorf("failed to read source object: %w", err)
+	}
+	defer srcReader.Close()
+
+	// Copy metadata from source, allowing override via x-amz-meta-* headers
+	metadataMap := make(map[string]string)
+	for k, v := range srcMeta.UserMetadata {
+		metadataMap[k] = v
+	}
+	for k, values := range r.Header {
+		if strings.HasPrefix(strings.ToLower(k), "x-amz-meta-") {
+			metadataMap[strings.TrimPrefix(k, "x-amz-meta-")] = values[0]
+		}
+	}
+
+	contentType := srcMeta.ContentType
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		contentType = ct
+	}
+
+	etag := uuid.New().String()
+	versionID := uuid.New().String()
+
+	objMetadata := &common.ObjectMetadata{
+		Key:            key,
+		Bucket:         bucket,
+		Size:           srcMeta.Size,
+		ContentType:    contentType,
+		ETag:           etag,
+		UserMetadata:   metadataMap,
+		StorageTier:    common.TierHot,
+		CreatedAt:      time.Now(),
+		ModifiedAt:     time.Now(),
+		AccessCount:    0,
+		LastAccessedAt: time.Now(),
+		Encrypted:      srcMeta.Encrypted,
+		VersionID:      versionID,
+	}
+
+	storageTier := common.TierHot
+	if err := g.store.Put(r.Context(), bucket, key, srcReader, srcMeta.Size, storageTier, objMetadata); err != nil {
+		return fmt.Errorf("failed to copy object: %w", err)
+	}
+
+	meta := &metadata.ObjectMetadata{
+		Key:            key,
+		Bucket:         bucket,
+		Size:           srcMeta.Size,
+		ContentType:    contentType,
+		ETag:           etag,
+		UserMetadata:   metadataMap,
+		StorageTier:    int(common.TierHot),
+		CreatedAt:      time.Now(),
+		ModifiedAt:     time.Now(),
+		AccessCount:    0,
+		LastAccessedAt: time.Now(),
+		Encrypted:      srcMeta.Encrypted,
+		VersionID:      versionID,
+		IsLatest:       true,
+		ObjectStatus:   "active",
+	}
+
+	if err := g.metadata.PutObject(r.Context(), bucket, key, meta); err != nil {
+		return fmt.Errorf("failed to store metadata: %w", err)
+	}
+
+	if g.tiering != nil {
+		g.tiering.RecordAccess(r.Context(), bucket, key, "PUT", userID)
+	}
+
+	// Publish s3:ObjectCreated:Copy event
+	if g.eventBus != nil {
+		g.eventBus.Publish(r.Context(), &events.Event{
+			EventType:    "s3:ObjectCreated:Copy",
+			Bucket:       bucket,
+			Key:          key,
+			VersionID:    versionID,
+			ETag:         etag,
+			Size:         srcMeta.Size,
+			RequesterARN: userID,
+			SourceIP:     r.RemoteAddr,
+		})
+	}
+
+	g.auditLog(r, "COPY", bucket, key, userID, "success", map[string]interface{}{
+		"source_bucket": srcBucket,
+		"source_key":    srcKey,
+		"size":          srcMeta.Size,
+	})
+
+	w.Header().Set("ETag", `"`+etag+`"`)
+	w.Header().Set("x-amz-version-id", versionID)
+	w.Header().Set("x-amz-copy-source-version-id", srcMeta.VersionID)
+
+	output := CopyObjectResult{
+		LastModified: time.Now().Format(time.RFC3339),
+		ETag:         `"` + etag + `"`,
+	}
+
+	return g.writeXML(w, http.StatusOK, output)
 }
 
 func (g *S3Gateway) handleObjectPOST(w http.ResponseWriter, r *http.Request, bucket, key string) error {

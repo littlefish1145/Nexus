@@ -112,7 +112,14 @@ func (q *DeadLetterQueue) retryLoop(sender *WebhookSender) {
 				backoff = 16 * time.Second
 			}
 
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+				// Proceed with retry
+			case <-q.stopCh:
+				timer.Stop()
+				return
+			}
 
 			result := sender.Send(entry.Event, entry.Rule.Destination)
 			if result.Success {

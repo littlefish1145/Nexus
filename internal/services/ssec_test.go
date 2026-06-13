@@ -88,7 +88,9 @@ func TestEncryptWithClientKey_DecryptWithWrongKey(t *testing.T) {
 
 	// Try to decrypt with wrong key
 	ciphertextReader := bytes.NewReader(ciphertext)
-	_, err = coordinator.DecryptWithClientKey(ctx, ciphertextReader, wrongKey, metadata, ciphertextSize)
+	decryptedReader, err := coordinator.DecryptWithClientKey(ctx, ciphertextReader, wrongKey, metadata, ciphertextSize)
+	require.NoError(t, err) // DecryptWithClientKey returns a streaming reader, error occurs on read
+	_, err = io.ReadAll(decryptedReader)
 	assert.Error(t, err)
 }
 
@@ -137,8 +139,8 @@ func TestEncryptWithClientKey_MetadataFormat(t *testing.T) {
 	_, metadata, _, err := coordinator.EncryptWithClientKey(ctx, plaintextReader, clientKey, int64(len(plaintext)))
 	require.NoError(t, err)
 
-	// Metadata should be nonce (12 bytes) + authTag (16 bytes) = 28 bytes
-	assert.Equal(t, 28, len(metadata))
+	// Metadata should be nonce (12 bytes) + originalSize (8 bytes) = 20 bytes
+	assert.Equal(t, 20, len(metadata))
 }
 
 func TestDecryptWithClientKey_InvalidMetadata(t *testing.T) {
@@ -167,7 +169,7 @@ func TestDecryptWithClientKey_InvalidKeySize(t *testing.T) {
 	_, err := rand.Read(shortKey)
 	require.NoError(t, err)
 
-	metadata := make([]byte, 28)
+	metadata := make([]byte, 20)
 	ciphertext := []byte("some ciphertext data")
 
 	ciphertextReader := bytes.NewReader(ciphertext)
