@@ -21,16 +21,47 @@ var rootCmd = &cobra.Command{
 	Short: "Nexus CLI - Management tool for Nexus storage system",
 	Long: `Nexus Control (nexusctl) is a command-line tool for managing
 Nexus S3-compatible storage system.`,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Load config and apply defaults
+		cfg, err := loadConfig()
+		if err != nil {
+			// Non-fatal: just warn
+			fmt.Fprintf(os.Stderr, "Warning: failed to load config: %v\n", err)
+			return
+		}
+
+		// Apply config defaults if flags not explicitly set
+		if !cmd.Flags().Changed("address") && cfg.Address != "" {
+			address = cfg.Address
+		}
+		if !cmd.Flags().Changed("output") && cfg.Output != "" {
+			outputFmt = cfg.Output
+		}
+
+		// Set credentials from config if available
+		if cfg.AccessKey != "" {
+			os.Setenv("NEXUS_ACCESS_KEY", cfg.AccessKey)
+		}
+		if cfg.SecretKey != "" {
+			os.Setenv("NEXUS_SECRET_KEY", cfg.SecretKey)
+		}
+	},
 }
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&address, "address", "http://localhost:8080", "Nexus server address")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
+	rootCmd.PersistentFlags().StringVarP(&outputFmt, "output", "o", "text", "Output format (json, yaml, text)")
+	rootCmd.PersistentFlags().StringVar(&queryStr, "query", "", "JMESPath query to filter output")
 }
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if outputFmt == "json" || outputFmt == "yaml" {
+			formatError(err, 500)
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -57,32 +88,29 @@ var statusCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		resp, err := serverRequest("GET", "/health")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error connecting to server: %v\n", err)
+			formatError(fmt.Errorf("connecting to server: %w", err), 503)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
+			formatError(fmt.Errorf("reading response: %w", err), 500)
 			os.Exit(1)
 		}
 
 		var health map[string]interface{}
 		if err := json.Unmarshal(body, &health); err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+			formatError(fmt.Errorf("parsing response: %w", err), 500)
 			os.Exit(1)
 		}
 
-		fmt.Printf("Status:    %v\n", health["status"])
-		fmt.Printf("Timestamp: %v\n", health["timestamp"])
-
-		if checks, ok := health["checks"].(map[string]interface{}); ok {
-			fmt.Println("\nChecks:")
-			for k, v := range checks {
-				fmt.Printf("  %-15s %v\n", k+":", v)
-			}
+		out, err := formatOutput(health, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
 		}
+		fmt.Println(out)
 	},
 }
 
@@ -104,18 +132,24 @@ var tieringRunCmd = &cobra.Command{
 
 		resp, err := serverRequest("POST", path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			formatError(err, 503)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 			body, _ := io.ReadAll(resp.Body)
-			fmt.Fprintf(os.Stderr, "Error: %s (status %d)\n", string(body), resp.StatusCode)
+			formatError(fmt.Errorf("%s (status %d)", string(body), resp.StatusCode), resp.StatusCode)
 			os.Exit(1)
 		}
 
-		fmt.Println("Tiering execution triggered successfully")
+		result := map[string]string{"message": "Tiering execution triggered successfully"}
+		out, err := formatOutput(result, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
+		}
+		fmt.Println(out)
 	},
 }
 
@@ -125,18 +159,29 @@ var tieringStatusCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		resp, err := serverRequest("GET", "/admin/tiering/status")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			formatError(err, 503)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
+			formatError(fmt.Errorf("reading response: %w", err), 500)
 			os.Exit(1)
 		}
 
-		fmt.Println(string(body))
+		var data interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			fmt.Println(string(body))
+			return
+		}
+
+		out, err := formatOutput(data, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
+		}
+		fmt.Println(out)
 	},
 }
 
@@ -158,18 +203,24 @@ var vectorRebuildCmd = &cobra.Command{
 
 		resp, err := serverRequest("POST", path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			formatError(err, 503)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 			body, _ := io.ReadAll(resp.Body)
-			fmt.Fprintf(os.Stderr, "Error: %s (status %d)\n", string(body), resp.StatusCode)
+			formatError(fmt.Errorf("%s (status %d)", string(body), resp.StatusCode), resp.StatusCode)
 			os.Exit(1)
 		}
 
-		fmt.Println("Vector index rebuild triggered successfully")
+		result := map[string]string{"message": "Vector index rebuild triggered successfully"}
+		out, err := formatOutput(result, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
+		}
+		fmt.Println(out)
 	},
 }
 
@@ -179,18 +230,29 @@ var vectorStatsCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		resp, err := serverRequest("GET", "/admin/vector/stats")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			formatError(err, 503)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
+			formatError(fmt.Errorf("reading response: %w", err), 500)
 			os.Exit(1)
 		}
 
-		fmt.Println(string(body))
+		var data interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			fmt.Println(string(body))
+			return
+		}
+
+		out, err := formatOutput(data, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
+		}
+		fmt.Println(out)
 	},
 }
 
@@ -212,18 +274,24 @@ var cryptoRotateCmd = &cobra.Command{
 
 		resp, err := serverRequest("POST", path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			formatError(err, 503)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 			body, _ := io.ReadAll(resp.Body)
-			fmt.Fprintf(os.Stderr, "Error: %s (status %d)\n", string(body), resp.StatusCode)
+			formatError(fmt.Errorf("%s (status %d)", string(body), resp.StatusCode), resp.StatusCode)
 			os.Exit(1)
 		}
 
-		fmt.Println("Key rotation triggered successfully")
+		result := map[string]string{"message": "Key rotation triggered successfully"}
+		out, err := formatOutput(result, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
+		}
+		fmt.Println(out)
 	},
 }
 
@@ -233,18 +301,29 @@ var cryptoStatusCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		resp, err := serverRequest("GET", "/admin/crypto/status")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			formatError(err, 503)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
+			formatError(fmt.Errorf("reading response: %w", err), 500)
 			os.Exit(1)
 		}
 
-		fmt.Println(string(body))
+		var data interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			fmt.Println(string(body))
+			return
+		}
+
+		out, err := formatOutput(data, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
+		}
+		fmt.Println(out)
 	},
 }
 
@@ -261,14 +340,14 @@ var profileCmd = &cobra.Command{
 
 		resp, err := serverRequest("GET", path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			formatError(err, 503)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
-			fmt.Fprintf(os.Stderr, "Error: %s (status %d)\n", string(body), resp.StatusCode)
+			formatError(fmt.Errorf("%s (status %d)", string(body), resp.StatusCode), resp.StatusCode)
 			os.Exit(1)
 		}
 
@@ -279,17 +358,23 @@ var profileCmd = &cobra.Command{
 
 		f, err := os.Create(outFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating file: %v\n", err)
+			formatError(fmt.Errorf("creating file: %w", err), 500)
 			os.Exit(1)
 		}
 		defer f.Close()
 
 		if _, err := io.Copy(f, resp.Body); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing profile: %v\n", err)
+			formatError(fmt.Errorf("writing profile: %w", err), 500)
 			os.Exit(1)
 		}
 
-		fmt.Printf("Profile saved to %s\n", outFile)
+		result := map[string]string{"message": fmt.Sprintf("Profile saved to %s", outFile)}
+		out, err := formatOutput(result, outputFmt, queryStr)
+		if err != nil {
+			formatError(err, 500)
+			os.Exit(1)
+		}
+		fmt.Println(out)
 	},
 }
 

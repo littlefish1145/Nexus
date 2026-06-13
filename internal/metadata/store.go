@@ -85,6 +85,9 @@ type ObjectMetadata struct {
 	PipelineResults  map[string]string `json:"pipeline_results,omitempty"`
 	DeleteMarker     bool              `json:"delete_marker,omitempty"`
 	RetainUntil      *time.Time        `json:"retain_until,omitempty"`
+	SSECUsed         bool              `json:"ssec_used"`
+	SSECKeySHA256    string            `json:"ssec_key_sha256"`
+	SSECAlgorithm    string            `json:"ssec_algorithm"`
 }
 
 type BucketInfo struct {

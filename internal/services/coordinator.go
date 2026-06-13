@@ -3,8 +3,11 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"time"
@@ -293,6 +296,107 @@ func (c *EncryptionCoordinator) DeleteKey(ctx context.Context, userID, bucket, o
 		zap.String("object_key", objectKey))
 
 	return nil
+}
+
+// EncryptWithClientKey encrypts data using a customer-provided key (SSE-C).
+// The client key is used directly as the DEK (no envelope encryption).
+// Returns ciphertext reader, nonce+authTag metadata, ciphertext size, error.
+// The client key is NEVER persisted.
+func (c *EncryptionCoordinator) EncryptWithClientKey(ctx context.Context, plaintext io.Reader, clientKey []byte, objectSize int64) (io.Reader, []byte, int64, error) {
+	if len(clientKey) != 32 {
+		return nil, nil, 0, fmt.Errorf("invalid client key size: expected 32 bytes, got %d", len(clientKey))
+	}
+
+	block, err := aes.NewCipher(clientKey)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, nil, 0, fmt.Errorf("failed to generate nonce: %w", err)
+	}
+
+	plaintextData, err := io.ReadAll(plaintext)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("failed to read plaintext: %w", err)
+	}
+
+	ciphertext := gcm.Seal(nil, nonce, plaintextData, nil)
+
+	// Split ciphertext and authTag: GCM authTag is the last 16 bytes of the sealed output
+	authTagLen := 16
+	if len(ciphertext) < authTagLen {
+		return nil, nil, 0, fmt.Errorf("ciphertext too short")
+	}
+	authTag := ciphertext[len(ciphertext)-authTagLen:]
+	pureCiphertext := ciphertext[:len(ciphertext)-authTagLen]
+
+	// Combine nonce and authTag for metadata storage (same pattern as EncryptOperation)
+	metadata := append(nonce, authTag...)
+
+	zap.L().Info("sse-c encryption completed",
+		zap.Int("plaintext_size", len(plaintextData)),
+		zap.Int("ciphertext_size", len(pureCiphertext)))
+
+	return io.NopCloser(bytes.NewReader(pureCiphertext)), metadata, int64(len(pureCiphertext)), nil
+}
+
+// DecryptWithClientKey decrypts data using a customer-provided key (SSE-C).
+// The client key is used directly as the DEK.
+func (c *EncryptionCoordinator) DecryptWithClientKey(ctx context.Context, ciphertext io.Reader, clientKey []byte, metadata []byte, objectSize int64) (io.Reader, error) {
+	if len(clientKey) != 32 {
+		return nil, fmt.Errorf("invalid client key size: expected 32 bytes, got %d", len(clientKey))
+	}
+
+	block, err := aes.NewCipher(clientKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	// Parse metadata (nonce + authTag)
+	nonceLen := gcm.NonceSize()
+	authTagLen := 16
+	if len(metadata) < nonceLen+authTagLen {
+		return nil, fmt.Errorf("invalid metadata: too short")
+	}
+	nonce := metadata[:nonceLen]
+	authTag := metadata[nonceLen : nonceLen+authTagLen]
+
+	ciphertextData, err := io.ReadAll(ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read ciphertext: %w", err)
+	}
+
+	// Reconstruct the full GCM sealed data: ciphertext || authTag
+	gcmData := append(ciphertextData, authTag...)
+
+	plaintext, err := gcm.Open(nil, nonce, gcmData, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt data: %w", err)
+	}
+
+	zap.L().Info("sse-c decryption completed",
+		zap.Int("ciphertext_size", len(ciphertextData)),
+		zap.Int("plaintext_size", len(plaintext)))
+
+	return io.NopCloser(bytes.NewReader(plaintext)), nil
+}
+
+// ComputeSSECKeySHA256 computes the SHA-256 hash of a client key for storage verification.
+func ComputeSSECKeySHA256(clientKey []byte) string {
+	h := sha256.Sum256(clientKey)
+	return fmt.Sprintf("%x", h[:])
 }
 
 // Close closes all services

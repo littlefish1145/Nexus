@@ -23,10 +23,20 @@ type Config struct {
 	TLS            TLSConfig        `mapstructure:"tls"`
 	RateLimit      RateLimitConfig   `mapstructure:"ratelimit"`
 	Replication    ReplicationConfig `mapstructure:"replication"`
+	Events         EventsConfig      `mapstructure:"events"`
 }
 
 type ReplicationConfig struct {
 	AllowPrivateEndpoint bool `mapstructure:"allow_private_endpoint"`
+}
+
+type EventsConfig struct {
+	Enabled        bool   `mapstructure:"enabled"`
+	Workers        int    `mapstructure:"workers"`
+	MaxRetries     int    `mapstructure:"max_retries"`
+	RetryBaseMS    int    `mapstructure:"retry_base_ms"`
+	WebhookTimeout string `mapstructure:"webhook_timeout"`
+	DeadLetterDir  string `mapstructure:"dead_letter_dir"`
 }
 
 type NodeConfig struct {
@@ -232,6 +242,12 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("ratelimit.upload_bytes_per_sec", 52428800)
 	viper.SetDefault("ratelimit.upload_burst_bytes", 104857600)
 	viper.SetDefault("replication.allow_private_endpoint", false)
+	viper.SetDefault("events.enabled", false)
+	viper.SetDefault("events.workers", 16)
+	viper.SetDefault("events.max_retries", 3)
+	viper.SetDefault("events.retry_base_ms", 1000)
+	viper.SetDefault("events.webhook_timeout", "5s")
+	viper.SetDefault("events.dead_letter_dir", "data/deadletter")
 
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("failed to read config: %w", err)

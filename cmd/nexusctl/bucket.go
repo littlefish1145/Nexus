@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -84,25 +85,33 @@ type ListAllMyBucketsResult struct {
 }
 
 type Bucket struct {
-	Name         string    `xml:"Name"`
-	CreationDate time.Time `xml:"CreationDate"`
+	Name         string    `xml:"Name" json:"name"`
+	CreationDate time.Time `xml:"CreationDate" json:"creation_date"`
 }
 
 type ListBucketResult struct {
-	XMLName   xml.Name    `xml:"ListBucketResult"`
-	Name      string      `xml:"Name"`
-	Prefix    string      `xml:"Prefix"`
-	Marker    string      `xml:"Marker"`
-	MaxKeys   int         `xml:"MaxKeys"`
-	IsTruncated bool      `xml:"IsTruncated"`
-	Contents  []Object `xml:"Contents"`
+	XMLName   xml.Name `xml:"ListBucketResult"`
+	Name      string   `xml:"Name" json:"name"`
+	Prefix    string   `xml:"Prefix" json:"prefix"`
+	Marker    string   `xml:"Marker" json:"marker"`
+	MaxKeys   int      `xml:"MaxKeys" json:"max_keys"`
+	IsTruncated bool    `xml:"IsTruncated" json:"is_truncated"`
+	Contents  []Object `xml:"Contents" json:"contents"`
 }
 
 type Object struct {
-	Key          string    `xml:"Key"`
-	LastModified time.Time `xml:"LastModified"`
-	ETag        string    `xml:"ETag"`
-	Size        int64     `xml:"Size"`
+	Key          string    `xml:"Key" json:"key"`
+	LastModified time.Time `xml:"LastModified" json:"last_modified"`
+	ETag        string    `xml:"ETag" json:"etag"`
+	Size        int64     `xml:"Size" json:"size"`
+}
+
+// BucketInfo represents bucket details for structured output.
+type BucketInfo struct {
+	Name       string `json:"name"`
+	Objects    int    `json:"objects"`
+	TotalSize  string `json:"total_size"`
+	TotalBytes int64  `json:"total_bytes"`
 }
 
 func init() {
@@ -120,6 +129,7 @@ func init() {
 
 	bucketCreateCmd.Flags().String("acl", "private", "Bucket ACL (private, public-read, public-read-write)")
 	bucketSetACLCmd.Flags().String("acl", "private", "Bucket ACL (private, public-read, public-read-write, authenticated-read)")
+	bucketObjectsCmd.Flags().String("prefix", "", "Filter objects by prefix")
 }
 
 func getAuthHeader() string {
@@ -203,7 +213,16 @@ func runBucketCreate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create bucket: %s (status %d)", string(body), resp.StatusCode)
 	}
 
-	fmt.Printf("✓ Bucket '%s' created successfully (ACL: %s)\n", bucketName, acl)
+	result := map[string]string{
+		"name":    bucketName,
+		"acl":     acl,
+		"message": fmt.Sprintf("Bucket '%s' created successfully", bucketName),
+	}
+	out, err := formatOutput(result, outputFmt, queryStr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
 	return nil
 }
 
@@ -237,15 +256,29 @@ func runBucketList(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(result.Buckets.Bucket) == 0 {
-		fmt.Println("No buckets found")
+		out, err := formatOutput([]Bucket{}, outputFmt, queryStr)
+		if err != nil {
+			return err
+		}
+		fmt.Println(out)
 		return nil
 	}
 
-	fmt.Printf("%-30s %s\n", "BUCKET NAME", "CREATION DATE")
-	fmt.Println(strings.Repeat("-", 55))
-	for _, bucket := range result.Buckets.Bucket {
-		fmt.Printf("%-30s %s\n", bucket.Name, bucket.CreationDate.Format("2006-01-02 15:04:05"))
+	// For text mode, use table format
+	if outputFmt == "text" && queryStr == "" {
+		fmt.Printf("%-30s %s\n", "BUCKET NAME", "CREATION DATE")
+		fmt.Println(strings.Repeat("-", 55))
+		for _, bucket := range result.Buckets.Bucket {
+			fmt.Printf("%-30s %s\n", bucket.Name, bucket.CreationDate.Format("2006-01-02 15:04:05"))
+		}
+		return nil
 	}
+
+	out, err := formatOutput(result.Buckets.Bucket, outputFmt, queryStr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
 	return nil
 }
 
@@ -271,7 +304,15 @@ func runBucketDelete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to delete bucket: %s (status %d)", string(body), resp.StatusCode)
 	}
 
-	fmt.Printf("✓ Bucket '%s' deleted successfully\n", bucketName)
+	result := map[string]string{
+		"name":    bucketName,
+		"message": fmt.Sprintf("Bucket '%s' deleted successfully", bucketName),
+	}
+	out, err := formatOutput(result, outputFmt, queryStr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
 	return nil
 }
 
@@ -280,7 +321,10 @@ func runBucketInfo(cmd *cobra.Command, args []string) error {
 
 	objects, err := listObjects(bucketName)
 	if err != nil {
-		fmt.Printf("⚠ Warning: %v\n", err)
+		// Non-fatal warning
+		if outputFmt == "text" && queryStr == "" {
+			fmt.Printf("Warning: %v\n", err)
+		}
 	}
 
 	var totalSize int64
@@ -290,10 +334,26 @@ func runBucketInfo(cmd *cobra.Command, args []string) error {
 		objectCount++
 	}
 
-	fmt.Printf("%-20s %s\n", "Bucket Name:", bucketName)
-	fmt.Printf("%-20s %d\n", "Objects:", objectCount)
-	fmt.Printf("%-20s %s\n", "Total Size:", formatBytes(totalSize))
+	info := BucketInfo{
+		Name:       bucketName,
+		Objects:    objectCount,
+		TotalSize:  formatBytes(totalSize),
+		TotalBytes: totalSize,
+	}
 
+	// For text mode, use key-value format
+	if outputFmt == "text" && queryStr == "" {
+		fmt.Printf("%-20s %s\n", "Bucket Name:", bucketName)
+		fmt.Printf("%-20s %d\n", "Objects:", objectCount)
+		fmt.Printf("%-20s %s\n", "Total Size:", formatBytes(totalSize))
+		return nil
+	}
+
+	out, err := formatOutput(info, outputFmt, queryStr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
 	return nil
 }
 
@@ -307,17 +367,31 @@ func runBucketObjects(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(objects) == 0 {
-		fmt.Println("No objects found")
+		out, err := formatOutput([]Object{}, outputFmt, queryStr)
+		if err != nil {
+			return err
+		}
+		fmt.Println(out)
 		return nil
 	}
 
-	fmt.Printf("%-40s %12s %s\n", "OBJECT NAME", "SIZE", "LAST MODIFIED")
-	fmt.Println(strings.Repeat("-", 75))
-	for _, obj := range objects {
-		modified := obj.LastModified.Format("2006-01-02 15:04:05")
-		fmt.Printf("%-40s %12s %s\n", truncateString(obj.Key, 40), formatBytes(obj.Size), modified)
+	// For text mode, use table format
+	if outputFmt == "text" && queryStr == "" {
+		fmt.Printf("%-40s %12s %s\n", "OBJECT NAME", "SIZE", "LAST MODIFIED")
+		fmt.Println(strings.Repeat("-", 75))
+		for _, obj := range objects {
+			modified := obj.LastModified.Format("2006-01-02 15:04:05")
+			fmt.Printf("%-40s %12s %s\n", truncateString(obj.Key, 40), formatBytes(obj.Size), modified)
+		}
+		fmt.Printf("\n%d objects, %s total\n", len(objects), formatBytes(sumSizes(objects)))
+		return nil
 	}
-	fmt.Printf("\n%d objects, %s total\n", len(objects), formatBytes(sumSizes(objects)))
+
+	out, err := formatOutput(objects, outputFmt, queryStr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
 	return nil
 }
 
@@ -425,7 +499,16 @@ func runBucketSetACL(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to set bucket ACL: %s (status %d)", string(body), resp.StatusCode)
 	}
 
-	fmt.Printf("✓ Bucket '%s' ACL set to '%s'\n", bucketName, acl)
+	result := map[string]string{
+		"bucket":  bucketName,
+		"acl":     acl,
+		"message": fmt.Sprintf("Bucket '%s' ACL set to '%s'", bucketName, acl),
+	}
+	out, err := formatOutput(result, outputFmt, queryStr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
 	return nil
 }
 
@@ -457,6 +540,22 @@ func runBucketGetACL(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	fmt.Println(string(body))
+	// For text mode, output raw body
+	if outputFmt == "text" && queryStr == "" {
+		fmt.Println(string(body))
+		return nil
+	}
+
+	// Try to parse as JSON for structured output
+	var data interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		data = string(body)
+	}
+
+	out, err := formatOutput(data, outputFmt, queryStr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
 	return nil
 }

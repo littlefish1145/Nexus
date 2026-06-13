@@ -23,6 +23,7 @@ import (
 	"nexus/internal/cache"
 	"nexus/internal/common"
 	"nexus/internal/config"
+	"nexus/internal/events"
 	"nexus/internal/metadata"
 	"nexus/internal/pipeline"
 	"nexus/internal/ratelimit"
@@ -60,6 +61,7 @@ type S3Gateway struct {
 	server          *http.Server
 	buckets         map[string]*BucketState
 	accessLog       *AccessLogger
+	eventBus        *events.EventBus
 }
 
 type BucketState struct {
@@ -310,6 +312,28 @@ func (g *S3Gateway) initializeComponents(cfg *config.Config) error {
 		g.metaCache = cache.NewMetadataCache(cfg.Cache.TTL)
 	}
 
+	if cfg.Events.Enabled {
+		webhookTimeout := 5 * time.Second
+		if cfg.Events.WebhookTimeout != "" {
+			if d, err := time.ParseDuration(cfg.Events.WebhookTimeout); err == nil {
+				webhookTimeout = d
+			}
+		}
+		dlqDir := cfg.Events.DeadLetterDir
+		if dlqDir == "" {
+			dlqDir = cfg.Node.DataDir + "/deadletter"
+		}
+		bus := events.NewEventBus(
+			cfg.Events.Workers,
+			webhookTimeout,
+			dlqDir,
+			cfg.Events.MaxRetries,
+			cfg.Events.RetryBaseMS,
+		)
+		bus.Start()
+		g.eventBus = bus
+	}
+
 	return nil
 }
 
@@ -464,9 +488,9 @@ func (g *S3Gateway) setCORSHeaders(w http.ResponseWriter, r *http.Request, bucke
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Length, x-amz-content-sha256, x-amz-date, x-amz-security-token, x-amz-user-agent, x-amz-meta-*, x-amz-acl, x-amz-copy-source, x-amz-tagging, x-amz-server-side-encryption, x-amz-checksum-crc32c, x-amz-checksum-sha256, x-amz-checksum-md5, x-amz-checksum-mode, X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, X-Amz-Signature, amz-sdk-invocation-id, amz-sdk-request, amz-sdk-retry")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Length, x-amz-content-sha256, x-amz-date, x-amz-security-token, x-amz-user-agent, x-amz-meta-*, x-amz-acl, x-amz-copy-source, x-amz-tagging, x-amz-server-side-encryption, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key, x-amz-server-side-encryption-customer-key-MD5, x-amz-checksum-crc32c, x-amz-checksum-sha256, x-amz-checksum-md5, x-amz-checksum-mode, X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, X-Amz-Signature, amz-sdk-invocation-id, amz-sdk-request, amz-sdk-retry")
 	w.Header().Set("Access-Control-Max-Age", "3600")
-	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Amz-Version-Id, X-Amz-Request-Id, X-Amz-Expiration, X-Amz-Checksum-CRC32C, X-Amz-Checksum-SHA256, X-Amz-Checksum-MD5")
+	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Amz-Version-Id, X-Amz-Request-Id, X-Amz-Expiration, X-Amz-Checksum-CRC32C, X-Amz-Checksum-SHA256, X-Amz-Checksum-MD5, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key-MD5")
 }
 
 func (g *S3Gateway) validateBucketName(name string) bool {
@@ -1009,8 +1033,30 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 	var encryptedDEKMetadata []byte
 	var encrypted bool
 	var actualStorageSize int64 = contentLength
+	var ssecUsed bool
+	var ssecKeySHA256 string
 
-	if g.cryptoCoordinator != nil && g.config != nil && g.config.CryptoServices.Enabled {
+	// Check for SSE-C headers BEFORE the existing encryption path
+	clientKey, ssecErr := parseSSECHeaders(r)
+	if ssecErr != nil {
+		g.writeError(w, http.StatusBadRequest, "InvalidRequest", ssecErr.Error())
+		return nil
+	}
+
+	if clientKey != nil && g.cryptoCoordinator != nil {
+		// SSE-C: encrypt with client-provided key
+		ssecUsed = true
+		ssecKeySHA256 = services.ComputeSSECKeySHA256(clientKey)
+
+		encryptedReader, ssecMetadata, ciphertextSize, err := g.cryptoCoordinator.EncryptWithClientKey(r.Context(), plaintextReader, clientKey, contentLength)
+		if err != nil {
+			return fmt.Errorf("SSE-C encryption failed: %w", err)
+		}
+		dataReader = encryptedReader
+		encryptedDEKMetadata = ssecMetadata
+		encrypted = true
+		actualStorageSize = ciphertextSize
+	} else if g.cryptoCoordinator != nil && g.config != nil && g.config.CryptoServices.Enabled {
 		encryptedReader, _, metadata, ciphertextSize, err := g.cryptoCoordinator.EncryptOperation(r.Context(), userID, bucket, key, plaintextReader, contentLength)
 		if err != nil {
 			return fmt.Errorf("encryption failed: %w", err)
@@ -1098,10 +1144,25 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		ObjectStatus:   "active",
 		Checksum:       storedChecksum,
 		ChecksumType:   storedChecksumType,
+		SSECUsed:       ssecUsed,
+		SSECKeySHA256:  ssecKeySHA256,
+		SSECAlgorithm:  func() string {
+			if ssecUsed {
+				return "AES256"
+			}
+			return ""
+		}(),
 	}
 
 	if encryptedDEKMetadata != nil {
 		meta.EncryptedDEK = encryptedDEKMetadata
+	}
+
+	// SSE-C: disable dedup - client-provided keys mean each object has unique encryption
+	if ssecUsed && g.config != nil && g.config.Encryption.EnableDedup {
+		// Dedup is not safe with SSE-C because each object is encrypted with a
+		// different customer key, so identical plaintexts produce different ciphertexts.
+		// Skip dedup logic for SSE-C objects.
 	}
 
 	if err := g.metadata.PutObject(r.Context(), bucket, key, meta); err != nil {
@@ -1126,7 +1187,10 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.Header().Set("x-amz-version-id", objMetadata.VersionID)
-	if encrypted {
+	if ssecUsed {
+		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
+		w.Header().Set("x-amz-server-side-encryption", "AES256")
+	} else if encrypted {
 		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
 	switch storedChecksumType {
@@ -1139,11 +1203,28 @@ func (g *S3Gateway) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 	}
 	w.WriteHeader(http.StatusOK)
 
-	g.auditLog(r, "PUT", bucket, key, userID, "success", map[string]interface{}{
+	auditDetails := map[string]interface{}{
 		"size":         contentLength,
 		"content_type": contentType,
 		"encrypted":    encrypted,
-	})
+	}
+	if ssecUsed {
+		auditDetails["sse_c_used"] = true
+	}
+	g.auditLog(r, "PUT", bucket, key, userID, "success", auditDetails)
+
+	if g.eventBus != nil {
+		g.eventBus.Publish(r.Context(), &events.Event{
+			EventType:    "s3:ObjectCreated:Put",
+			Bucket:       bucket,
+			Key:          key,
+			VersionID:    objMetadata.VersionID,
+			ETag:         etag,
+			Size:         contentLength,
+			RequesterARN: userID,
+			SourceIP:     extractIP(r),
+		})
+	}
 
 	return nil
 }
@@ -1244,7 +1325,33 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 	var dataReader io.Reader = reader
 	var contentLength = objMetadata.Size
 
-	if objMetadata.Encrypted && g.cryptoCoordinator != nil && len(objMetadata.EncryptedDEK) > 0 {
+	// SSE-C decryption path: if object was encrypted with SSE-C, require customer key
+	if objMetadata.SSECUsed {
+		clientKey, ssecErr := parseSSECHeadersForRead(r)
+		if ssecErr != nil {
+			g.writeError(w, http.StatusBadRequest, "InvalidRequest", ssecErr.Error())
+			return nil
+		}
+		if clientKey == nil {
+			g.writeError(w, http.StatusForbidden, "AccessDenied", "Object encrypted with SSE-C requires customer key headers")
+			return nil
+		}
+		// Verify the provided key matches the stored key SHA-256
+		keySHA256 := services.ComputeSSECKeySHA256(clientKey)
+		if keySHA256 != objMetadata.SSECKeySHA256 {
+			g.writeError(w, http.StatusForbidden, "AccessDenied", "The provided SSE-C key does not match the key used to encrypt the object")
+			return nil
+		}
+		if g.cryptoCoordinator != nil && len(objMetadata.EncryptedDEK) > 0 {
+			decryptedReader, err := g.cryptoCoordinator.DecryptWithClientKey(r.Context(), reader, clientKey, objMetadata.EncryptedDEK, objMetadata.Size)
+			if err != nil {
+				fmt.Printf("[nexus] SSE-C decryption error for %s/%s: %v\n", bucket, key, err)
+				g.writeError(w, http.StatusInternalServerError, "InternalError", "An internal error occurred while processing the object")
+				return nil
+			}
+			dataReader = decryptedReader
+		}
+	} else if objMetadata.Encrypted && g.cryptoCoordinator != nil && len(objMetadata.EncryptedDEK) > 0 {
 		encryptedDEKMetadata := objMetadata.EncryptedDEK
 
 		rawFallback := r.Header.Get("x-amz-raw-decryption-fallback") == "true"
@@ -1321,7 +1428,10 @@ func (g *S3Gateway) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 		w.Header().Set("X-Cache", "MISS")
 	}
 
-	if objMetadata.Encrypted {
+	if objMetadata.SSECUsed {
+		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
+		w.Header().Set("x-amz-server-side-encryption", "AES256")
+	} else if objMetadata.Encrypted {
 		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
 
@@ -1433,13 +1543,35 @@ func (g *S3Gateway) handleHeadObject(w http.ResponseWriter, r *http.Request, buc
 		return fmt.Errorf("object not found: %w", err)
 	}
 
+	// SSE-C: require customer key for HEAD if object was encrypted with SSE-C
+	if objMetadata.SSECUsed {
+		clientKey, ssecErr := parseSSECHeadersForRead(r)
+		if ssecErr != nil {
+			g.writeError(w, http.StatusBadRequest, "InvalidRequest", ssecErr.Error())
+			return nil
+		}
+		if clientKey == nil {
+			g.writeError(w, http.StatusForbidden, "AccessDenied", "Object encrypted with SSE-C requires customer key headers")
+			return nil
+		}
+		// Verify the provided key matches the stored key SHA-256
+		keySHA256 := services.ComputeSSECKeySHA256(clientKey)
+		if keySHA256 != objMetadata.SSECKeySHA256 {
+			g.writeError(w, http.StatusForbidden, "AccessDenied", "The provided SSE-C key does not match the key used to encrypt the object")
+			return nil
+		}
+	}
+
 	w.Header().Set("Content-Type", objMetadata.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(objMetadata.Size, 10))
 	w.Header().Set("ETag", `"`+objMetadata.ETag+`"`)
 	w.Header().Set("Last-Modified", objMetadata.ModifiedAt.Format(http.TimeFormat))
 	w.Header().Set("X-Amz-Storage-Class", common.StorageTier(objMetadata.StorageTier).String())
 
-	if objMetadata.Encrypted {
+	if objMetadata.SSECUsed {
+		w.Header().Set("x-amz-server-side-encryption-customer-algorithm", "AES256")
+		w.Header().Set("x-amz-server-side-encryption", "AES256")
+	} else if objMetadata.Encrypted {
 		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
 
@@ -1523,6 +1655,19 @@ func (g *S3Gateway) handleDeleteObject(w http.ResponseWriter, r *http.Request, b
 	g.auditLog(r, "DELETE", bucket, key, userID, "success", map[string]interface{}{
 		"soft_delete": softDelete && versioningEnabled,
 	})
+
+	if g.eventBus != nil {
+		g.eventBus.Publish(r.Context(), &events.Event{
+			EventType:    "s3:ObjectRemoved:Delete",
+			Bucket:       bucket,
+			Key:          key,
+			VersionID:    objMetadata.VersionID,
+			ETag:         objMetadata.ETag,
+			Size:         objMetadata.Size,
+			RequesterARN: userID,
+			SourceIP:     extractIP(r),
+		})
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 	return nil
@@ -1821,6 +1966,9 @@ func (g *S3Gateway) Stop() error {
 }
 
 func (g *S3Gateway) Close() error {
+	if g.eventBus != nil {
+		g.eventBus.Stop()
+	}
 	if g.accessLog != nil {
 		return g.accessLog.Close()
 	}
@@ -1857,6 +2005,10 @@ func (g *S3Gateway) SetIAMBridge(bridge *IAMAuthBridge) {
 
 func (g *S3Gateway) GetIAMBridge() *IAMAuthBridge {
 	return g.iamBridge
+}
+
+func (g *S3Gateway) GetEventBus() *events.EventBus {
+	return g.eventBus
 }
 
 func (g *S3Gateway) auditLog(r *http.Request, action, bucket, key, userID, result string, details map[string]interface{}) {
@@ -1938,6 +2090,93 @@ func (g *S3Gateway) isBucketPublicRead(r *http.Request, bucket string) bool {
 func (g *S3Gateway) validatePresignedURLMethod(r *http.Request, expectedMethod string) error {
 	_ = r.URL.Query().Get("X-Amz-Signature")
 	return nil
+}
+
+// parseSSECHeaders parses and validates SSE-C headers from the request.
+// Returns the decoded client key, or an error if validation fails.
+// If no SSE-C headers are present, returns nil key with no error.
+func parseSSECHeaders(r *http.Request) ([]byte, error) {
+	algorithm := r.Header.Get("x-amz-server-side-encryption-customer-algorithm")
+	keyB64 := r.Header.Get("x-amz-server-side-encryption-customer-key")
+	keyMD5B64 := r.Header.Get("x-amz-server-side-encryption-customer-key-MD5")
+
+	// No SSE-C headers present
+	if algorithm == "" && keyB64 == "" && keyMD5B64 == "" {
+		return nil, nil
+	}
+
+	// Validate algorithm
+	if algorithm != "AES256" {
+		return nil, fmt.Errorf("invalid SSE-C algorithm: must be AES256")
+	}
+
+	// Decode the customer key
+	clientKey, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SSE-C customer key: not valid base64")
+	}
+
+	// Validate key length (must be 32 bytes for AES-256)
+	if len(clientKey) != 32 {
+		return nil, fmt.Errorf("invalid SSE-C customer key: must be 256-bit (32 bytes)")
+	}
+
+	// Validate MD5 if provided
+	if keyMD5B64 != "" {
+		expectedMD5, err := base64.StdEncoding.DecodeString(keyMD5B64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SSE-C customer key MD5: not valid base64")
+		}
+		computedMD5 := md5.Sum(clientKey)
+		if !bytes.Equal(expectedMD5, computedMD5[:]) {
+			return nil, fmt.Errorf("SSE-C customer key MD5 mismatch")
+		}
+	}
+
+	return clientKey, nil
+}
+
+// parseSSECHeadersForRead parses SSE-C headers for GET/HEAD requests.
+// It requires all three SSE-C headers to be present if the object was encrypted with SSE-C.
+func parseSSECHeadersForRead(r *http.Request) ([]byte, error) {
+	algorithm := r.Header.Get("x-amz-server-side-encryption-customer-algorithm")
+	keyB64 := r.Header.Get("x-amz-server-side-encryption-customer-key")
+	keyMD5B64 := r.Header.Get("x-amz-server-side-encryption-customer-key-MD5")
+
+	// No SSE-C headers present
+	if algorithm == "" && keyB64 == "" && keyMD5B64 == "" {
+		return nil, nil
+	}
+
+	// Validate algorithm
+	if algorithm != "AES256" {
+		return nil, fmt.Errorf("invalid SSE-C algorithm: must be AES256")
+	}
+
+	// Decode the customer key
+	clientKey, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SSE-C customer key: not valid base64")
+	}
+
+	// Validate key length (must be 32 bytes for AES-256)
+	if len(clientKey) != 32 {
+		return nil, fmt.Errorf("invalid SSE-C customer key: must be 256-bit (32 bytes)")
+	}
+
+	// Validate MD5 if provided
+	if keyMD5B64 != "" {
+		expectedMD5, err := base64.StdEncoding.DecodeString(keyMD5B64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SSE-C customer key MD5: not valid base64")
+		}
+		computedMD5 := md5.Sum(clientKey)
+		if !bytes.Equal(expectedMD5, computedMD5[:]) {
+			return nil, fmt.Errorf("SSE-C customer key MD5 mismatch")
+		}
+	}
+
+	return clientKey, nil
 }
 
 func (g *S3Gateway) handleGetBucketLocation(w http.ResponseWriter, r *http.Request, bucket string) error {

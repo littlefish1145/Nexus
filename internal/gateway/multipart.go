@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"nexus/internal/common"
+	"nexus/internal/events"
 	"nexus/internal/metadata"
 )
 
@@ -381,6 +382,18 @@ func (h *MultipartUploadHandler) HandleCompleteMultipartUpload(w http.ResponseWr
 
 	if h.gateway.pipeline != nil {
 		go h.gateway.triggerPipelines(r.Context(), bucket, key, upload.ContentType, upload.Metadata)
+	}
+
+	if h.gateway.eventBus != nil {
+		h.gateway.eventBus.Publish(r.Context(), &events.Event{
+			EventType:    "s3:ObjectCreated:CompleteMultipartUpload",
+			Bucket:       bucket,
+			Key:          key,
+			VersionID:    objMetadata.VersionID,
+			ETag:         etag,
+			Size:         totalSize,
+			RequesterARN: upload.UserID,
+		})
 	}
 
 	w.Header().Set("ETag", `"`+etag+`"`)
