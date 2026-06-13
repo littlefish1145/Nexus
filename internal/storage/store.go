@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"nexus/internal/common"
+	"nexus/internal/config"
 )
 
 var (
@@ -48,6 +49,9 @@ type BackendStorage interface {
 	Exists(ctx context.Context, path string) (bool, error)
 	Size(ctx context.Context, path string) (int64, error)
 	List(ctx context.Context, prefix string) ([]string, error)
+	PutReader(ctx context.Context, path string, reader io.Reader) (etag string, err error)
+	GetRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error)
+	AtomicRename(ctx context.Context, oldPath, newPath string) error
 }
 
 type FileBackend struct {
@@ -201,6 +205,95 @@ func (f *FileBackend) Close() error {
 	return nil
 }
 
+func (f *FileBackend) PutReader(ctx context.Context, path string, reader io.Reader) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	fullPath := filepath.Join(f.rootDir, path)
+
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return "", fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Write to temp file first for atomic semantics
+	tmpFile, err := os.CreateTemp(filepath.Dir(fullPath), ".tmp-"+filepath.Base(fullPath))
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	written, err := io.Copy(tmpFile, reader)
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to write temp file: %w", err)
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to sync temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	if err := os.Rename(tmpPath, fullPath); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to rename temp file: %w", err)
+	}
+
+	etag := fmt.Sprintf(`"%x"`, written)
+	return etag, nil
+}
+
+func (f *FileBackend) GetRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	fullPath := filepath.Join(f.rootDir, path)
+
+	file, err := os.Open(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrObjectNotFound
+		}
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to seek file: %w", err)
+	}
+
+	return &limitedReadCloser{Reader: io.LimitReader(file, length), closer: file}, nil
+}
+
+func (f *FileBackend) AtomicRename(ctx context.Context, oldPath, newPath string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	fullOldPath := filepath.Join(f.rootDir, oldPath)
+	fullNewPath := filepath.Join(f.rootDir, newPath)
+
+	if err := os.MkdirAll(filepath.Dir(fullNewPath), 0755); err != nil {
+		return fmt.Errorf("failed to create target directory: %w", err)
+	}
+
+	if err := os.Rename(fullOldPath, fullNewPath); err != nil {
+		return fmt.Errorf("failed to rename file: %w", err)
+	}
+
+	return nil
+}
+
+type limitedReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (l *limitedReadCloser) Close() error {
+	return l.closer.Close()
+}
+
 type objectLock struct {
 	mu   sync.Mutex
 	refs int
@@ -230,6 +323,25 @@ func (s *TieredObjectStore) RegisterTier(tier common.StorageTier, backend Backen
 	defer s.mu.Unlock()
 	s.tiers[tier] = backend
 	s.maxSize[tier] = maxSize
+}
+
+// RegisterTierFromConfig creates a backend from the storage class config
+// and registers it for the given tier.
+func (s *TieredObjectStore) RegisterTierFromConfig(tier common.StorageTier, cfg config.StorageClassConfig, maxSize int64) error {
+	backend, err := NewBackendFromConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create backend for tier %s: %w", tier.String(), err)
+	}
+	s.RegisterTier(tier, backend, maxSize)
+	return nil
+}
+
+// GetTierBackend returns the backend for a given tier.
+func (s *TieredObjectStore) GetTierBackend(tier common.StorageTier) (BackendStorage, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b, ok := s.tiers[tier]
+	return b, ok
 }
 
 func (s *TieredObjectStore) Put(ctx context.Context, bucket, key string, data io.Reader, size int64, tier common.StorageTier, metadata *common.ObjectMetadata) error {

@@ -1181,6 +1181,8 @@ type VectorManager struct {
 	vectorMap        map[string]*Vector
 	cache            *QueryCache
 	embeddingProvider EmbeddingProvider
+	mmapEnabled      bool
+	bucketManager    *BucketIndexManager
 }
 
 type VectorConfig struct {
@@ -1205,6 +1207,13 @@ type VectorConfig struct {
 	RequireAuth         bool
 	AllowedContentTypes []string
 	MaxIndexContentSize int64
+	// MMap/disk-based index settings
+	MMapEnabled      bool
+	QuantizationType string // "none", "sq", "pq"
+	PQSubquantizers  int
+	IndexDataDir     string
+	RebuildInterval  string
+	FallbackMinutes  int
 }
 
 type QueryCache struct {
@@ -1336,6 +1345,7 @@ func NewVectorManager(config *VectorConfig) (*VectorManager, error) {
 		vectorMap:         make(map[string]*Vector),
 		cache:             NewQueryCache(cacheSize, cacheTTL),
 		embeddingProvider: embeddingProvider,
+		mmapEnabled:       config.MMapEnabled,
 	}, nil
 }
 
@@ -1571,10 +1581,47 @@ func (vm *VectorManager) SearchByText(ctx context.Context, queryText string, top
 }
 
 func (vm *VectorManager) Close() error {
+	// Flush mmap indexes to disk if dirty
+	if vm.mmapEnabled && vm.bucketManager != nil {
+		FlushDirtyIndexes(vm.bucketManager)
+		vm.bucketManager.CloseAll()
+	}
+
 	if vm.embeddingProvider != nil {
 		return vm.embeddingProvider.Close()
 	}
 	return nil
+}
+
+// InitMMap initializes the mmap-based bucket index manager.
+// Should be called after NewVectorManager when mmap is enabled.
+func (vm *VectorManager) InitMMap(dataDir string) error {
+	if !vm.mmapEnabled {
+		return nil
+	}
+
+	bm, err := NewBucketIndexManager(dataDir, vm.dim)
+	if err != nil {
+		return fmt.Errorf("failed to create bucket index manager: %w", err)
+	}
+	vm.bucketManager = bm
+
+	// Load existing mmap indexes
+	if err := LoadExistingIndexes(bm); err != nil {
+		return fmt.Errorf("failed to load existing indexes: %w", err)
+	}
+
+	return nil
+}
+
+// BucketManager returns the bucket index manager (nil if mmap not enabled).
+func (vm *VectorManager) BucketManager() *BucketIndexManager {
+	return vm.bucketManager
+}
+
+// IsMMapEnabled returns whether mmap-based indexing is enabled.
+func (vm *VectorManager) IsMMapEnabled() bool {
+	return vm.mmapEnabled
 }
 
 func EncodeVector(v []float32) []byte {
